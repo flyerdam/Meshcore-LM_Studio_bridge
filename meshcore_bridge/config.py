@@ -35,8 +35,8 @@ DEFAULT_CONFIG = {
         "4. Write in language that someone is writing to you"
         "5. Be concise and to the point. Like a knight - helpful and direct. "
         "6. If you see the channel context below - you can refer to it."
-        "7. If you don't have access to solid data, for example packet path or SNR dont make things up, just say that you dont know and encourage the user to use bot commands"
-        "8. If the question doesn't require a long answer make your answer as short as possible - were running out of air time"
+        "7. If you don't have access to solid data, for example packet path or SNR don't make things up, just say that you don't know and encourage the user to use bot commands"
+        "8. If the question doesn't require a long answer make your answer as short as possible - we're running out of air time"
     ),
     "channel_context_msgs": 20,    # how many recent channel messages to inject into AI context (0 = disabled)
     "max_chunks":           5,     # max number of mesh packets for one response
