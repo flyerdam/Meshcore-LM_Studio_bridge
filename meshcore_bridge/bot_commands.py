@@ -43,6 +43,13 @@ class BotCommands:
         "help":    "_cmd_help",
     }
 
+    # Reverse of CMDS: "_cmd_ping" → "ping" — built once at class-level
+    _CMD_KEY: dict[str, str] = {}
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls._CMD_KEY = {v: k for k, v in cls.CMDS.items()}
+
     def __init__(self, device_info: dict, cfg: dict,
                  llm: LMStudioClient, web: WebSearch, telemetry: dict, mc):
         self.device_info    = device_info
@@ -54,6 +61,9 @@ class BotCommands:
         self._chan_history: dict[int, deque] = {}
         # Channels with SNR monitoring enabled: {channel_idx}
         self._monitored_channels: set[int] = set()
+        # Ensure reverse lookup is populated for this class (covers direct instantiation)
+        if not BotCommands._CMD_KEY:
+            BotCommands._CMD_KEY = {v: k for k, v in self.CMDS.items()}
 
     def record_message(self, channel: int | None, sender: str, text: str, payload: dict):
         if channel is None:
@@ -80,9 +90,7 @@ class BotCommands:
 
     async def handle(self, cmd_name: str, args: str, sender: str,
                      payload: dict, channel: int | None) -> str:
-        # Build reverse lookup: "_cmd_ping" → "ping"
-        _reverse = {v: k for k, v in self.CMDS.items()}
-        cmd_key = _reverse.get(cmd_name)
+        cmd_key = self._CMD_KEY.get(cmd_name)
         disabled = self.cfg.get("disabled_commands", set())
         if cmd_key and cmd_key in disabled:
             return f"@[{sender}] This feature is not available."

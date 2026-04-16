@@ -11,6 +11,7 @@ part of the Python standard library on all major platforms).
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -97,8 +98,9 @@ BOT_FEATURES: list[tuple[str, str]] = [
 ]
 
 # Where to persist settings between sessions
-_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "bridge_gui_config.json")
+_CONFIG_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "bridge_gui_config.json")
+_STOP_TIMEOUT  = 8   # seconds to wait for the bridge thread to finish stopping
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -161,7 +163,7 @@ class _BridgeRunner(threading.Thread):
     def stop(self):
         if self._loop and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self._loop.stop)
-        self._stopped.wait(timeout=8)
+        self._stopped.wait(timeout=_STOP_TIMEOUT)
 
     @property
     def is_running(self) -> bool:
@@ -603,7 +605,6 @@ class App(tk.Tk):
         self.after(80, self._poll_log)
 
     def _append_record(self, record: logging.LogRecord):
-        import datetime
         ts  = datetime.datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
         msg = record.getMessage()
 
