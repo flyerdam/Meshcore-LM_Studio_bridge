@@ -32,6 +32,8 @@ class FakeSerial:
 class TestSerialConnection(unittest.IsolatedAsyncioTestCase):
     async def test_open_serial_sets_dtr_rts_false(self):
         fake_serial = FakeSerial()
+        self.assertTrue(fake_serial.dtr)
+        self.assertTrue(fake_serial.rts)
         fake_mc = types.SimpleNamespace(
             transport=types.SimpleNamespace(serial=fake_serial),
             disconnect=AsyncMock(),
@@ -55,7 +57,8 @@ class TestSerialConnection(unittest.IsolatedAsyncioTestCase):
         async def ok(_):
             return "ok"
 
-        with patch("meshcore_bridge.serial_connection.time.monotonic", return_value=4.0):
+        fake_monotonic_time = 4.0
+        with patch("meshcore_bridge.serial_connection.time.monotonic", return_value=fake_monotonic_time):
             with self.assertLogs("meshcore_bridge.serial_connection", level="INFO") as logs:
                 result = await conn.execute(ok, command_name="get_msg")
 

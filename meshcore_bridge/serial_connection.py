@@ -14,6 +14,9 @@ from meshcore import MeshCore
 
 log = logging.getLogger(__name__)
 
+IMMEDIATE_DISCONNECT_THRESHOLD_S = 1.5
+SUSTAINED_CONNECTION_THRESHOLD_S = 3.0
+
 
 class SerialConnection:
     """
@@ -115,14 +118,7 @@ class SerialConnection:
         """
         try:
             mc = await self.ensure_connected()
-            self._last_command = command_name
-            self._command_count += 1
-            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            log.info("TX %s ts=%s", command_name, ts)
-            result = await coro_factory(mc)
-            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            log.info("RX %s ts=%s result=%s", command_name, ts, type(result).__name__)
-            return result
+            return await self._execute_with_trace(mc, coro_factory, command_name)
         except (OSError, ConnectionError, SerialConnectionError) as exc:
             log.warning("Serial error during command: %s – triggering reconnect", exc)
             self._connected = False
@@ -130,14 +126,7 @@ class SerialConnection:
             mc = await self.reconnect()
             if mc is None:
                 raise
-            self._last_command = command_name
-            self._command_count += 1
-            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            log.info("TX %s ts=%s", command_name, ts)
-            result = await coro_factory(mc)
-            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            log.info("RX %s ts=%s result=%s", command_name, ts, type(result).__name__)
-            return result
+            return await self._execute_with_trace(mc, coro_factory, command_name)
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -239,11 +228,11 @@ class SerialConnection:
         if self._connected_since is None:
             return
         connected_for_s = time.monotonic() - self._connected_since
-        if self._command_count == 0 and connected_for_s < 1.5:
+        if self._command_count == 0 and connected_for_s < IMMEDIATE_DISCONNECT_THRESHOLD_S:
             phase = "immediate_after_open"
         elif self._command_count <= 1:
             phase = "after_first_command"
-        elif connected_for_s >= 3.0:
+        elif connected_for_s >= SUSTAINED_CONNECTION_THRESHOLD_S:
             phase = "after_several_seconds"
         else:
             phase = "unspecified"
@@ -256,6 +245,16 @@ class SerialConnection:
             self._last_command or "none",
             exc,
         )
+
+    async def _execute_with_trace(self, mc, coro_factory, command_name: str):
+        self._last_command = command_name
+        self._command_count += 1
+        ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        log.info("TX %s ts=%s", command_name, ts)
+        result = await coro_factory(mc)
+        ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        log.info("RX %s ts=%s result=%s", command_name, ts, type(result).__name__)
+        return result
 
 
 class SerialConnectionError(Exception):
