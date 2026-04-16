@@ -55,6 +55,10 @@ DEFAULT_CONFIG = {
     "reconnect_delay_s":    5,     # initial delay before reconnection attempt
     "reconnect_max_delay_s": 60,   # maximum delay between reconnection attempts
     "reconnect_max_retries": 0,    # max retries before giving up (0 = infinite)
+    # ── GUI / feature-gate settings ─────────────────────────────────────────
+    "message_cooldown_s":   0,     # per-sender cooldown between replies (0 = off)
+    "ai_enabled":           True,  # whether !ai LLM queries are accepted
+    "disabled_commands":    set(), # set of bot command keys to disable (e.g. {"news", "weather"})
 }
 
 

@@ -80,6 +80,12 @@ class BotCommands:
 
     async def handle(self, cmd_name: str, args: str, sender: str,
                      payload: dict, channel: int | None) -> str:
+        # Build reverse lookup: "_cmd_ping" → "ping"
+        _reverse = {v: k for k, v in self.CMDS.items()}
+        cmd_key = _reverse.get(cmd_name)
+        disabled = self.cfg.get("disabled_commands", set())
+        if cmd_key and cmd_key in disabled:
+            return f"@[{sender}] This feature is not available."
         method = getattr(self, cmd_name, None)
         if method:
             if inspect.iscoroutinefunction(method):

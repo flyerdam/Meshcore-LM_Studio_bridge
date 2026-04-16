@@ -4,6 +4,7 @@ Main bridge: ties MeshCore events to the LLM, bot commands, and web services.
 
 import asyncio
 import logging
+import time
 
 from meshcore import EventType
 
@@ -45,6 +46,9 @@ class MeshCoreLLMBridge:
         # Node telemetry (noise_floor, battery, uptime etc.)
         # Updated at startup and cyclically by _telemetry_loop
         self._telemetry: dict = {}
+
+        # Per-sender timestamp of last reply (for message_cooldown_s)
+        self._last_reply: dict[str, float] = {}
 
         # NOTE – there are three separate "histories" in the code:
         #
@@ -243,6 +247,23 @@ class MeshCoreLLMBridge:
                 ai_prefix  = self.cfg.get("ai_prefix",  "!ai").lower()
                 body_lower = body.lower()
 
+                is_command = (
+                    body_lower.startswith(bot_prefix)
+                    or ai_prefix in body_lower
+                )
+
+                # ── Per-sender cooldown ─────────────────────────────────────
+                cooldown = float(self.cfg.get("message_cooldown_s", 0))
+                if cooldown > 0 and is_command:
+                    last = self._last_reply.get(sender, 0.0)
+                    elapsed = time.monotonic() - last
+                    if elapsed < cooldown:
+                        remaining = cooldown - elapsed
+                        log.info(
+                            "COOLDOWN: %s must wait %.1fs more", sender, remaining
+                        )
+                        continue
+
                 # ── Bot Command ─────────────────────────────────────────────
                 if body_lower.startswith(bot_prefix):
                     after     = body[len(bot_prefix):].strip()
@@ -251,8 +272,10 @@ class MeshCoreLLMBridge:
                         log.info("BOT CMD: %s args='%s' from %s", cmd, args, sender)
                         response = await self.bot.handle(cmd, args, sender, payload, channel)
                         if response:
+                            self._last_reply[sender] = time.monotonic()
                             await self._send_chunked("", response, reply_ch, event)
                     else:
+                        self._last_reply[sender] = time.monotonic()
                         await self._send(
                             f"{mention}unknown command. {self.cfg.get('bot_prefix')} help",
                             reply_ch, event
@@ -261,9 +284,13 @@ class MeshCoreLLMBridge:
 
                 # ── LLM Trigger ─────────────────────────────────────────────
                 if ai_prefix in body_lower:
+                    if not self.cfg.get("ai_enabled", True):
+                        log.info("AI DISABLED — ignoring query from %s", sender)
+                        continue
                     pos      = body_lower.index(ai_prefix)
                     question = body[pos + len(ai_prefix):].strip()
                     log.info("AI TRIGGER | sender=%s question='%s'", sender, question)
+                    self._last_reply[sender] = time.monotonic()
                     await self._handle_llm(sender, question, mention, reply_ch, event, channel)
 
             except Exception as e:
