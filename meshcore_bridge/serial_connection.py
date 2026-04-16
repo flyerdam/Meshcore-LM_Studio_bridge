@@ -153,10 +153,30 @@ class SerialConnection:
             except Exception as exc:
                 log.debug("Error during serial disconnect: %s", exc)
             finally:
+                # Belt-and-suspenders: force-close the underlying pyserial port
+                # so the OS releases the COM port even if MeshCore's disconnect
+                # did not fully close it (e.g. after an abrupt stop).
+                self._force_close_serial(self._mc)
                 self._mc = None
 
         # Allow OS time to fully release the port.
         await asyncio.sleep(1.0)
+
+    @staticmethod
+    def _force_close_serial(mc) -> None:
+        """Close the raw pyserial port object directly, OS-level."""
+        if mc is None:
+            return
+        try:
+            transport  = getattr(mc, "_transport", None) or getattr(mc, "transport", None)
+            serial_obj = getattr(transport, "serial", None) if transport else None
+            if serial_obj is None:
+                serial_obj = getattr(mc, "_serial", None) or getattr(mc, "serial", None)
+            if serial_obj is not None and getattr(serial_obj, "is_open", False):
+                serial_obj.close()
+                log.info("Raw serial port force-closed")
+        except Exception as exc:
+            log.debug("Force-close serial error (non-fatal): %s", exc)
 
     async def _reconnect_loop(self) -> MeshCore | None:
         """Core reconnection loop with exponential backoff."""
