@@ -93,7 +93,8 @@ class BotCommands:
         cmd_key = self._CMD_KEY.get(cmd_name)
         disabled = self.cfg.get("disabled_commands", set())
         if cmd_key and cmd_key in disabled:
-            return f"@[{sender}] This feature is not available."
+            log.info("BOT CMD '%s' disabled — ignoring silently", cmd_key)
+            return ""
         method = getattr(self, cmd_name, None)
         if method:
             if inspect.iscoroutinefunction(method):

@@ -270,6 +270,9 @@ class MeshCoreLLMBridge:
                         response = await self.bot.handle(cmd, args, sender, payload, channel)
                         if response:
                             self._last_reply[sender] = time.monotonic()
+                            delay = float(self.cfg.get("reply_delay_s", 0))
+                            if delay > 0:
+                                await asyncio.sleep(delay)
                             await self._send_chunked("", response, reply_ch, event)
                     else:
                         self._last_reply[sender] = time.monotonic()
@@ -335,7 +338,7 @@ class MeshCoreLLMBridge:
                 None, self.llm.ask, sender, question, channel_context
             )
             log.info("LM Studio >> %s", answer[:120])
-            await asyncio.sleep(self.cfg["reply_delay_s"])
+            await asyncio.sleep(float(self.cfg.get("reply_delay_s", 0)))
             await self._send_chunked(mention, answer, reply_ch, orig_event)
         except Exception as e:
             log.exception("LLM Error")
