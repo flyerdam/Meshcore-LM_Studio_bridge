@@ -250,10 +250,10 @@ class SerialConnection:
         self._last_command = command_name
         self._command_count += 1
         ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-        log.info("TX %s ts=%s", command_name, ts)
+        log.debug("TX %s ts=%s", command_name, ts)
         result = await coro_factory(mc)
         ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-        log.info("RX %s ts=%s result=%s", command_name, ts, type(result).__name__)
+        log.debug("RX %s ts=%s result=%s", command_name, ts, type(result).__name__)
         return result
 
 
