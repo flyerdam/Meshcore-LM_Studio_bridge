@@ -55,10 +55,11 @@ DEFAULT_CONFIG = {
     "reconnect_delay_s":    5,     # initial delay before reconnection attempt
     "reconnect_max_delay_s": 60,   # maximum delay between reconnection attempts
     "reconnect_max_retries": 0,    # max retries before giving up (0 = infinite)
+    "log_level":            "INFO",
 }
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="MeshCore ↔ LM Studio bridge + bot",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -82,11 +83,17 @@ def parse_args():
                    help="How often in seconds to send monitored channels report (default 600)")
     p.add_argument("--channel-context",     type=int, default=5,
                    help="How many recent channel messages to add to AI context (0=disabled)")
+    p.add_argument(
+        "--log-level",
+        default=DEFAULT_CONFIG["log_level"],
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging level (default: INFO)",
+    )
 
     ch = p.add_argument_group("Channels")
     ch.add_argument("--listen-channels", nargs="+", type=int, metavar="N")
     ch.add_argument("--reply-channel",   type=int, metavar="N")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def build_config(args) -> dict:
@@ -105,5 +112,6 @@ def build_config(args) -> dict:
         "channel_context_msgs":  args.channel_context,
         "listen_channels":      args.listen_channels,
         "reply_channel":        args.reply_channel,
+        "log_level":            args.log_level,
     })
     return config

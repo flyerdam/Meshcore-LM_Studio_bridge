@@ -7,6 +7,8 @@ device resets or the COM port becomes blocked/unavailable.
 
 import asyncio
 import logging
+import time
+from datetime import datetime, timezone
 
 from meshcore import MeshCore
 
@@ -31,6 +33,9 @@ class SerialConnection:
         self._connected = False
         self._reconnecting = False
         self._connect_lock = asyncio.Lock()
+        self._connected_since: float | None = None
+        self._last_command: str | None = None
+        self._command_count = 0
 
         # Backoff parameters
         self._initial_delay = cfg.get("reconnect_delay_s", 5)
@@ -56,13 +61,16 @@ class SerialConnection:
         async with self._connect_lock:
             self._mc = await self._open_serial()
             self._connected = True
+            self._connected_since = time.monotonic()
+            self._last_command = None
+            self._command_count = 0
             log.info("Serial connected on %s @ %d baud", self.port, self.baud)
             return self._mc
 
     async def disconnect(self):
         """Cleanly close the connection."""
         async with self._connect_lock:
-            await self._close()
+            await self._close(reason="manual_disconnect")
 
     async def reconnect(self) -> MeshCore | None:
         """
@@ -94,7 +102,7 @@ class SerialConnection:
             raise ConnectionError("Unable to reconnect to MeshCore")
         return mc
 
-    async def execute(self, coro_factory):
+    async def execute(self, coro_factory, command_name: str = "unknown_command"):
         """
         Execute an async MeshCore command, reconnecting on serial errors.
 
@@ -107,14 +115,29 @@ class SerialConnection:
         """
         try:
             mc = await self.ensure_connected()
-            return await coro_factory(mc)
+            self._last_command = command_name
+            self._command_count += 1
+            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            log.info("TX %s ts=%s", command_name, ts)
+            result = await coro_factory(mc)
+            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            log.info("RX %s ts=%s result=%s", command_name, ts, type(result).__name__)
+            return result
         except (OSError, ConnectionError, SerialConnectionError) as exc:
             log.warning("Serial error during command: %s – triggering reconnect", exc)
             self._connected = False
+            self._log_disconnect(reason=f"command_error:{command_name}", exc=exc)
             mc = await self.reconnect()
             if mc is None:
                 raise
-            return await coro_factory(mc)
+            self._last_command = command_name
+            self._command_count += 1
+            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            log.info("TX %s ts=%s", command_name, ts)
+            result = await coro_factory(mc)
+            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            log.info("RX %s ts=%s result=%s", command_name, ts, type(result).__name__)
+            return result
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -135,16 +158,32 @@ class SerialConnection:
             if serial_obj is None:
                 serial_obj = getattr(mc, "_serial", None) or getattr(mc, "serial", None)
             if serial_obj is not None:
+                log.info(
+                    "Serial lines on open %s: dtr=%s rts=%s dsr=%s cts=%s",
+                    self.port,
+                    getattr(serial_obj, "dtr", None),
+                    getattr(serial_obj, "rts", None),
+                    getattr(serial_obj, "dsr", None),
+                    getattr(serial_obj, "cts", None),
+                )
                 serial_obj.dtr = False
                 serial_obj.rts = False
-                log.debug("DTR/RTS set to False on %s", self.port)
+                log.info(
+                    "Serial lines after forcing low %s: dtr=%s rts=%s dsr=%s cts=%s",
+                    self.port,
+                    getattr(serial_obj, "dtr", None),
+                    getattr(serial_obj, "rts", None),
+                    getattr(serial_obj, "dsr", None),
+                    getattr(serial_obj, "cts", None),
+                )
         except Exception as exc:
             log.debug("Could not set DTR/RTS: %s (non-fatal)", exc)
 
         return mc
 
-    async def _close(self):
+    async def _close(self, reason: str = "disconnect"):
         """Disconnect the current MeshCore instance gracefully."""
+        self._log_disconnect(reason=reason)
         self._connected = False
         if self._mc is not None:
             try:
@@ -154,13 +193,14 @@ class SerialConnection:
                 log.debug("Error during serial disconnect: %s", exc)
             finally:
                 self._mc = None
+        self._connected_since = None
 
         # Allow OS time to fully release the port.
         await asyncio.sleep(1.0)
 
     async def _reconnect_loop(self) -> MeshCore | None:
         """Core reconnection loop with exponential backoff."""
-        await self._close()
+        await self._close(reason="reconnect_start")
 
         delay = self._initial_delay
         attempt = 0
@@ -183,6 +223,9 @@ class SerialConnection:
             try:
                 self._mc = await self._open_serial()
                 self._connected = True
+                self._connected_since = time.monotonic()
+                self._last_command = None
+                self._command_count = 0
                 log.info(
                     "Reconnected to %s on attempt %d", self.port, attempt
                 )
@@ -191,6 +234,28 @@ class SerialConnection:
                 log.error("Reconnect attempt %d failed: %s", attempt, exc)
                 # Exponential backoff (capped)
                 delay = min(delay * 2, self._max_delay)
+
+    def _log_disconnect(self, reason: str, exc: Exception | None = None):
+        if self._connected_since is None:
+            return
+        connected_for_s = time.monotonic() - self._connected_since
+        if self._command_count == 0 and connected_for_s < 1.5:
+            phase = "immediate_after_open"
+        elif self._command_count <= 1:
+            phase = "after_first_command"
+        elif connected_for_s >= 3.0:
+            phase = "after_several_seconds"
+        else:
+            phase = "unspecified"
+        log.warning(
+            "Serial disconnect phase=%s reason=%s connected_for=%.2fs commands=%d last_command=%s error=%s",
+            phase,
+            reason,
+            connected_for_s,
+            self._command_count,
+            self._last_command or "none",
+            exc,
+        )
 
 
 class SerialConnectionError(Exception):

@@ -72,8 +72,11 @@ class MeshCoreLLMBridge:
 
         device_info = {}
         try:
-            info = await asyncio.wait_for(
-                mc.commands.send_device_query(), timeout=5.0
+            info = await self.serial.execute(
+                lambda linked_mc: asyncio.wait_for(
+                    linked_mc.commands.send_device_query(), timeout=5.0
+                ),
+                command_name="send_device_query",
             )
             if info.type != EventType.ERROR and info.payload:
                 device_info = info.payload
@@ -106,7 +109,12 @@ class MeshCoreLLMBridge:
                 if method is None:
                     log.debug("Method %s unavailable in this library version", method_name)
                     continue
-                result = await asyncio.wait_for(method(), timeout=5.0)
+                result = await self.serial.execute(
+                    lambda linked_mc, method_name=method_name: asyncio.wait_for(
+                        getattr(linked_mc.commands, method_name)(), timeout=5.0
+                    ),
+                    command_name=method_name,
+                )
                 log.info("TELEMETRY %s type=%s payload=%s", label, result.type, result.payload)
                 if result.type != EventType.ERROR and result.payload:
                     self._telemetry.update(result.payload)
@@ -153,8 +161,10 @@ class MeshCoreLLMBridge:
         text = fit_to_bytes(text, BYTE_LIMIT)
         log.info(">> REMINDER [ch%d] (%dB): %s", channel, len(text.encode()), text)
         try:
-            mc = await self.serial.ensure_connected()
-            result = await mc.commands.send_chan_msg(channel, text)
+            result = await self.serial.execute(
+                lambda mc: mc.commands.send_chan_msg(channel, text),
+                command_name=f"send_chan_msg[ch={channel}]",
+            )
             if result.type == EventType.ERROR:
                 log.error("Error sending reminder ch%d: %s", channel, result.payload)
         except Exception as e:
@@ -329,7 +339,10 @@ class MeshCoreLLMBridge:
         if channel is not None:
             log.info(">> [ch%d] (%dB): %s", channel, len(text.encode()), text)
             try:
-                result = await mc.commands.send_chan_msg(channel, text)
+                result = await self.serial.execute(
+                    lambda linked_mc: linked_mc.commands.send_chan_msg(channel, text),
+                    command_name=f"send_chan_msg[ch={channel}]",
+                )
                 if result.type == EventType.ERROR:
                     log.error("Error sending ch%d: %s", channel, result.payload)
             except (OSError, ConnectionError) as exc:
@@ -345,8 +358,11 @@ class MeshCoreLLMBridge:
 
             if dst_key_prefix:
                 try:
-                    contacts_result = await asyncio.wait_for(
-                        mc.commands.get_contacts(), timeout=5.0
+                    contacts_result = await self.serial.execute(
+                        lambda linked_mc: asyncio.wait_for(
+                            linked_mc.commands.get_contacts(), timeout=5.0
+                        ),
+                        command_name="get_contacts",
                     )
                     if contacts_result.type != EventType.ERROR and contacts_result.payload:
                         contacts_dict = contacts_result.payload
@@ -368,7 +384,10 @@ class MeshCoreLLMBridge:
                 display_name = contact.get("adv_name") or contact.get("pubkey", "?")[:8]
                 log.info(">> [direct→%s] (%dB): %s", display_name, len(text.encode()), text)
                 try:
-                    await mc.commands.send_msg(contact, text)
+                    await self.serial.execute(
+                        lambda linked_mc: linked_mc.commands.send_msg(contact, text),
+                        command_name=f"send_msg[{display_name}]",
+                    )
                 except (OSError, ConnectionError) as exc:
                     log.warning("Serial error sending DM to %s: %s – reconnecting",
                                 display_name, exc)
@@ -410,7 +429,10 @@ class MeshCoreLLMBridge:
         while True:
             try:
                 mc = await self.serial.ensure_connected()
-                event = await mc.commands.get_msg(timeout=interval)
+                event = await self.serial.execute(
+                    lambda linked_mc: linked_mc.commands.get_msg(timeout=interval),
+                    command_name="get_msg",
+                )
                 consecutive_errors = 0  # reset on success
 
                 if event is not None and event.type not in (
