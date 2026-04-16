@@ -43,20 +43,26 @@ import sys
 from meshcore_bridge.config import parse_args, build_config
 from meshcore_bridge.bridge import MeshCoreLLMBridge
 
-# ─── Logger ────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("AIbridge.log", encoding="utf-8"),
-    ],
-)
 log = logging.getLogger(__name__)
+
+
+def setup_logging(level_name: str):
+    level = getattr(logging, (level_name or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("AIbridge.log", encoding="utf-8"),
+        ],
+        force=True,
+    )
+    log.info("Log level set to %s", logging.getLevelName(level))
 
 
 async def main():
     args   = parse_args()
+    setup_logging(args.log_level)
     config = build_config(args)
 
     bridge = MeshCoreLLMBridge(config)

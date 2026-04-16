@@ -30,6 +30,8 @@ You can customize the bot without editing the code:
 
     --baud 115200: Set the baud rate.
 
+    --log-level DEBUG: Set runtime logging verbosity (DEBUG/INFO/WARNING/ERROR/CRITICAL).
+
     --model "model-name": Model name passed to the LLM backend.
 
     --news-key YOUR_KEY: Enable NewsAPI features.
