@@ -88,10 +88,12 @@ DEFAULT_CONFIG = {
         "\nRESPONSE RULES: "
         "1. Only the final answer - zero train of thought, zero headers. "
         "2. Max 300 characters - you are in a mesh network, long answers are split into packets. "
-        "3. No markdown, asterisks, or lists. Plain text only. "
-        "4. Write in English, unless someone speaks in another language. "
+        "3. No markdown, asterisks, or lists. Plain text only but you can use emojis. "
+        "4. Write in language that someone is writing to you"
         "5. Be concise and to the point. Like a knight - helpful and direct. "
         "6. If you see the channel context below - you can refer to it."
+        "7. If you don't have access to solid data, for example packet path or SNR dont make things up, just say that you dont know and encourage the user to use bot commands"
+        "8. If the question doesn't require a long answer make your answer as short as possible - were running out of air time"
     ),
     "channel_context_msgs": 20,    # how many recent channel messages to inject into AI context (0 = disabled)
     "max_chunks":           5,     # max number of mesh packets for one response
@@ -180,7 +182,7 @@ def _hops_quality(hops: int) -> str:
     if hops == 0:    return "direct"
     if hops == 1:    return "1 hop"
     if hops <= 3:    return f"{hops} hops"
-    return f"{hops} hops ⚠️"
+    return f"{hops} hops"
 
 
 def _wmo_code(code: int) -> str:
@@ -447,7 +449,7 @@ class BotCommands:
         snr  = _p(payload, "snr")
         hops = _to_int(_p(payload, "path_len", default=0))
         q    = _snr_quality(snr)
-        return f"@{sender} Pong! 🏓 SNR:{snr}({q}) {_hops_quality(hops)}"
+        return f"@[{sender}] Pong! 🏓 SNR:{snr}({q}) {_hops_quality(hops)}"
 
     def _cmd_test(self, args, sender, payload, channel) -> str:
         snr  = _p(payload, "snr")
@@ -455,7 +457,7 @@ class BotCommands:
         ts   = _to_int(_p(payload, "sender_timestamp", default=0))
         t    = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "?"
         q    = _snr_quality(snr)
-        return f"@{sender} Ack! ✅ SNR:{snr}({q}) {_hops_quality(hops)} {t}"
+        return f"@[{sender}] Ack! ✅ SNR:{snr}({q}) {_hops_quality(hops)} {t}"
 
     def _cmd_info(self, args, sender, payload, channel) -> str:
         d = self.device_info or {}
@@ -495,7 +497,7 @@ class BotCommands:
         rf   = (f" SNR:{snr}"    if snr  is not None else "") + \
                (f" RSSI:{rssi}"  if rssi is not None else "")
 
-        return f"@{sender} {mdl} {ver} up:{upt_str}{nfl_str}{batt_str}{mem_str}{rf}"
+        return f"@[{sender}] {mdl} {ver} up:{upt_str}{nfl_str}{batt_str}{mem_str}{rf}"
 
     def _cmd_stats(self, args, sender, payload, channel) -> str:
         t     = self.telemetry or {}
@@ -512,9 +514,9 @@ class BotCommands:
             available = {k: v for k, v in t.items()
                         if k not in ("model", "ver", "fw_build", "fw ver")}
             if available:
-                return f"@{sender} telemetry: {available}"
-            return f"@{sender} no statistical data (firmware does not provide)"
-        return f"@{sender} rx:{recv} tx:{sent} flood:{flood} dir:{direct} err:{errs} dup:{dups}{air_s}"
+                return f"@[{sender}] telemetry: {available}"
+            return f"@[{sender}] no statistical data (firmware does not provide)"
+        return f"@[{sender}] rx:{recv} tx:{sent} flood:{flood} dir:{direct} err:{errs} dup:{dups}{air_s}"
 
     def _cmd_path(self, args, sender, payload, channel) -> str:
         path = _p(payload, "path", "route", default="")
@@ -531,13 +533,13 @@ class BotCommands:
             warn = " ⚠️ weak signal"
         else:
             warn = " ✅"
-        return f"@{sender} path:{path} SNR:{snr}{warn}"
+        return f"@[{sender}] path:{path} SNR:{snr}{warn}"
 
     def _cmd_weather(self, args, sender, payload, channel) -> str:
-        return f"@{sender} {self.web.weather(args.strip() or None)}"
+        return f"@[{sender}] {self.web.weather(args.strip() or None)}"
 
     def _cmd_news(self, args, sender, payload, channel) -> str:
-        return f"@{sender} {self.web.news(args.strip() or None)}"
+        return f"@[{sender}] {self.web.news(args.strip() or None)}"
 
     async def _cmd_channels(self, args, sender, payload, channel) -> str:
         """Fetches the list of configured channels from the device."""
@@ -546,10 +548,10 @@ class BotCommands:
                 self.mc.commands.get_channels(), timeout=5.0
             )
             if result.type == EventType.ERROR:
-                return f"@{sender} error fetching channels: {result.payload}"
+                return f"@[{sender}] error fetching channels: {result.payload}"
             channels = result.payload
             if not channels:
-                return f"@{sender} no configured channels"
+                return f"@[{sender}] no configured channels"
             # channels is a dict or list - handle both formats
             if isinstance(channels, dict):
                 items = channels.items()
@@ -560,12 +562,12 @@ class BotCommands:
                 name = ch.get("name", "") if isinstance(ch, dict) else str(ch)
                 num  = ch.get("idx", ch.get("index", idx)) if isinstance(ch, dict) else idx
                 parts.append(f"ch{num}:{name}" if name else f"ch{num}")
-            return f"@{sender} channels: {' | '.join(parts)}"
+            return f"@[{sender}] channels: {' | '.join(parts)}"
         except asyncio.TimeoutError:
-            return f"@{sender} channel fetch timeout"
+            return f"@[{sender}] channel fetch timeout"
         except Exception as e:
             log.error("get_channels error: %s", e)
-            return f"@{sender} error: {e}"
+            return f"@[{sender}] error: {e}"
 
     async def _cmd_reset_paths(self, args, sender, payload, channel) -> str:
         """Resets routes to all known contacts – switches to flood routing."""
@@ -574,10 +576,10 @@ class BotCommands:
                 self.mc.commands.get_contacts(), timeout=5.0
             )
             if contacts_result.type == EventType.ERROR:
-                return f"@{sender} error fetching contacts: {contacts_result.payload}"
+                return f"@[{sender}] error fetching contacts: {contacts_result.payload}"
             contacts = contacts_result.payload or {}
             if not contacts:
-                return f"@{sender} no contacts – no routes to reset"
+                return f"@[{sender}] no contacts – no routes to reset"
 
             reset_ok   = []
             reset_fail = []
@@ -596,18 +598,18 @@ class BotCommands:
 
             ok_str   = f"ok: {', '.join(reset_ok)}" if reset_ok else ""
             fail_str = f" error: {', '.join(reset_fail)}" if reset_fail else ""
-            return f"@{sender} path reset {ok_str}{fail_str} | flood routing active"
+            return f"@[{sender}] path reset {ok_str}{fail_str} | flood routing active"
         except asyncio.TimeoutError:
-            return f"@{sender} timeout – reset failed"
+            return f"@[{sender}] timeout – reset failed"
         except Exception as e:
             log.error("reset_path error: %s", e)
-            return f"@{sender} error: {e}"
+            return f"@[{sender}] error: {e}"
 
     def _cmd_help(self, args, sender, payload, channel) -> str:
         bp = self.cfg.get("bot_prefix", "!bot")
         ap = self.cfg.get("ai_prefix",  "!ai")
         return (
-            f"@{sender} {bp}: ping test info stats path snr "
+            f"@[{sender}] {bp}: ping test info stats path snr "
             f"weather <city> news search <what> "
             f"channel channels reset monitor [on/off] | "
             f"{ap}: <question> reset | priv: works with prefix"
@@ -627,35 +629,35 @@ class BotCommands:
         analysis = await asyncio.get_event_loop().run_in_executor(
             None, self.llm.analyze, prompt
         )
-        return f"@{sender} {analysis}"
+        return f"@[{sender}] {analysis}"
 
     async def _cmd_search(self, args, sender, payload, channel) -> str:
         if not args.strip():
-            return f"@{sender} provide what to search: {self.cfg.get('bot_prefix')} search bitcoin"
+            return f"@[{sender}] provide what to search: {self.cfg.get('bot_prefix')} search bitcoin"
         result = await asyncio.get_event_loop().run_in_executor(
             None, self.web.search, args.strip()
         )
-        return f"@{sender} {result}"
+        return f"@[{sender}] {result}"
 
     def _cmd_monitor(self, args, sender, payload, channel) -> str:
         """Enables/disables passive SNR monitoring on the channel."""
         if channel is None:
-            return f"@{sender} monitor only works on group channels."
+            return f"@[{sender}] monitor only works on group channels."
         cmd = args.strip().lower()
         bp  = self.cfg.get("bot_prefix", "!bot")
         if cmd in ("on", "enable", "start", "1"):
             self._monitored_channels.add(channel)
             return (
-                f"@{sender} Monitor ch{channel} enabled. "
+                f"@[{sender}] Monitor ch{channel} enabled. "
                 f"I will warn when SNR<0 or connection is critical."
             )
         if cmd in ("off", "disable", "stop", "0"):
             self._monitored_channels.discard(channel)
-            return f"@{sender} Monitor ch{channel} disabled."
+            return f"@[{sender}] Monitor ch{channel} disabled."
         # No argument – show status
         status = "enabled" if channel in self._monitored_channels else "disabled"
         return (
-            f"@{sender} Monitor ch{channel}: {status}. "
+            f"@[{sender}] Monitor ch{channel}: {status}. "
             f"Use: {bp} monitor on / off"
         )
 
@@ -731,10 +733,10 @@ class BotCommands:
 
     async def _cmd_chan_analysis(self, args, sender, payload, channel) -> str:
         if channel is None:
-            return f"@{sender} channel analysis only works on group channels."
+            return f"@[{sender}] channel analysis only works on group channels."
         hist = self._chan_history.get(channel)
         if not hist or len(hist) < 3:
-            return f"@{sender} not enough messages in history (min. 3)."
+            return f"@[{sender}] not enough messages in history (min. 3)."
 
         entries = list(hist)[-20:]
 
@@ -776,7 +778,7 @@ class BotCommands:
         # Quick response without AI when not enough data
         if len(entries) < 5 or not all_snr:
             lines = " | ".join(sender_lines[:4])
-            return f"@{sender} {global_str} | {lines} | {monitor_str}"
+            return f"@[{sender}] {global_str} | {lines} | {monitor_str}"
 
         # ── Full AI Analysis ────────────────────────────────────────────────
         prompt = (
@@ -790,7 +792,7 @@ class BotCommands:
         analysis = await asyncio.get_event_loop().run_in_executor(
             None, self.llm.analyze, prompt
         )
-        return f"@{sender} {global_str} | {analysis} | {monitor_str}"
+        return f"@[{sender}] {global_str} | {analysis} | {monitor_str}"
 
 
 # ─── Bridge ────────────────────────────────────────────────────────────────
@@ -1012,7 +1014,7 @@ class MeshCoreLLMBridge:
                 if monitor_warn:
                     await self._send(monitor_warn, reply_ch, event)
 
-                mention    = f"@{sender} " if sender and sender != "UNKNOWN" else ""
+                mention    = f"@[{sender}] " if sender and sender != "UNKNOWN" else ""
                 bot_prefix = self.cfg.get("bot_prefix", "!bot").lower()
                 ai_prefix  = self.cfg.get("ai_prefix",  "!ai").lower()
                 body_lower = body.lower()
