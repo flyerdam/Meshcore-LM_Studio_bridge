@@ -884,8 +884,7 @@ class App(ctk.CTk):
             runner.stop()
             self.after(0, lambda: self._set_running(False))
 
-        threading.Thread(target=_do_stop, daemon=True,
-                          name="bridge-stop").start()
+        threading.Thread(target=_do_stop, daemon=True, name="bridge-stop").start()
 
     def on_close(self):
         if self._runner and self._runner.is_running:

@@ -247,14 +247,11 @@ class MeshCoreLLMBridge:
                 ai_prefix  = self.cfg.get("ai_prefix",  "!ai").lower()
                 body_lower = body.lower()
 
-                is_command = (
-                    body_lower.startswith(bot_prefix)
-                    or ai_prefix in body_lower
-                )
-
                 # ── Per-sender cooldown ─────────────────────────────────────
                 cooldown = float(self.cfg.get("message_cooldown_s", 0))
-                if cooldown > 0 and is_command:
+                if cooldown > 0 and (
+                    body_lower.startswith(bot_prefix) or ai_prefix in body_lower
+                ):
                     last = self._last_reply.get(sender, 0.0)
                     elapsed = time.monotonic() - last
                     if elapsed < cooldown:

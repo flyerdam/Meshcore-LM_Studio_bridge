@@ -168,7 +168,7 @@ class SerialConnection:
         if mc is None:
             return
         try:
-            transport  = getattr(mc, "_transport", None) or getattr(mc, "transport", None)
+            transport = getattr(mc, "_transport", None) or getattr(mc, "transport", None)
             serial_obj = getattr(transport, "serial", None) if transport else None
             if serial_obj is None:
                 serial_obj = getattr(mc, "_serial", None) or getattr(mc, "serial", None)
