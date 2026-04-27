@@ -4,6 +4,7 @@ Main bridge: ties MeshCore events to the LLM, bot commands, and web services.
 
 import asyncio
 import logging
+import re
 import time
 
 from meshcore import EventType
@@ -50,6 +51,9 @@ class MeshCoreLLMBridge:
         # Per-sender timestamp of last reply (for message_cooldown_s)
         self._last_reply: dict[str, float] = {}
 
+        # Own node name – populated in connect(); used for @mention detection
+        self._own_name: str = ""
+
         # NOTE – there are three separate "histories" in the code:
         #
         # 1. LMStudioClient._histories[sender]
@@ -91,6 +95,12 @@ class MeshCoreLLMBridge:
 
         await self._refresh_telemetry()
         device_info.update(self._telemetry)
+        self._own_name = str(
+            get_payload_value(device_info, "adv_name", "name", default="")
+        )
+        if self._own_name:
+            log.info("Own node name: %s  (mention trigger: @[%s])",
+                     self._own_name, self._own_name)
         self.bot = BotCommands(device_info, self.cfg, self.llm, self.web,
                                self._telemetry, mc)
 
@@ -209,6 +219,113 @@ class MeshCoreLLMBridge:
             return cs.strip(), body.strip()
         return "", text.strip()
 
+    @staticmethod
+    def _normalize_mention_name(value: str) -> str:
+        """Normalize mention names so @name and names with emoji/punctuation can match."""
+        if not value:
+            return ""
+        return "".join(ch for ch in value.lower() if ch.isalnum())
+
+    def _mention_aliases(self) -> set[str]:
+        """Build normalized alias set for mention matching."""
+        aliases: set[str] = set()
+
+        own_norm = self._normalize_mention_name(self._own_name)
+        if own_norm:
+            aliases.add(own_norm)
+
+        # Fallback: parse assistant name from system prompt: named 'flyer AI'
+        system_prompt = str(self.cfg.get("system_prompt", ""))
+        m = re.search(r"named\s+['\"]([^'\"]+)['\"]", system_prompt, re.IGNORECASE)
+        if m:
+            p_norm = self._normalize_mention_name(m.group(1))
+            if p_norm:
+                aliases.add(p_norm)
+
+        return aliases
+
+    def _extract_mention_question(self, body: str) -> str | None:
+        """Return question text if message mentions this node, else None."""
+        if not self.cfg.get("mention_ai_enabled", True):
+            return None
+
+        aliases = self._mention_aliases()
+        if not aliases:
+            return None
+
+        # Accept both @name and @[name]
+        for match in re.finditer(r"@\[(?P<bracket>[^\]]+)\]|@(?P<plain>[^\s]+)", body):
+            raw_name = (match.group("bracket") or match.group("plain") or "").strip()
+            cand_norm = self._normalize_mention_name(raw_name)
+            if not cand_norm:
+                continue
+            if cand_norm in aliases:
+                return body[match.end():].lstrip(" \t,:;-")
+        return None
+
+    def _collect_channel_context(self, channel: int | None) -> list[dict] | None:
+        """Return filtered recent channel context for LLM requests."""
+        ctx_count = self.cfg.get("channel_context_msgs", 5)
+        if ctx_count <= 0 or channel is None or not self.bot:
+            return None
+
+        hist = self.bot._chan_history.get(channel)
+        if not hist:
+            return None
+
+        bot_pfx = str(self.cfg.get("bot_prefix", "!bot") or "").lower()
+        ai_pfx = str(self.cfg.get("ai_prefix", "!ai") or "").lower()
+
+        context_entries = []
+        for m in list(hist):
+            txt = str(m.get("text", ""))
+            low = txt.lower()
+
+            is_bot = (bot_pfx and low.startswith(bot_pfx)) or (
+                (not bot_pfx) and self.bot.match(txt)[0] is not None
+            )
+            is_ai = bool(ai_pfx) and ai_pfx in low
+
+            if not is_bot and not is_ai:
+                context_entries.append(m)
+
+        if not context_entries:
+            return None
+        return context_entries[-ctx_count:]
+
+    async def _should_auto_reply(self, sender: str, body: str,
+                                 channel: int | None) -> bool:
+        """Tiered proactive-reply gate."""
+        intensity = self.cfg.get("auto_engage_intensity", "off")
+        # backward compat: old bool flag
+        if intensity == "off" and self.cfg.get("auto_engage_worth_reply", False):
+            intensity = "normal"
+        if intensity == "off":
+            return False
+        if not self.cfg.get("ai_enabled", True):
+            return False
+        if not body.strip():
+            return False
+
+        # Avoid self-chat loops
+        sender_norm = self._normalize_mention_name(sender)
+        if sender_norm and sender_norm in self._mention_aliases():
+            return False
+
+        # If message mentions someone else and not this bot, keep silent.
+        aliases = self._mention_aliases()
+        for match in re.finditer(r"@\[(?P<bracket>[^\]]+)\]|@(?P<plain>[^\s]+)", body):
+            raw_name = (match.group("bracket") or match.group("plain") or "").strip()
+            cand_norm = self._normalize_mention_name(raw_name)
+            if cand_norm and cand_norm not in aliases:
+                return False
+
+        channel_context = self._collect_channel_context(channel)
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self.llm.should_reply, sender, body, channel_context,
+            sorted(aliases), intensity
+        )
+
     # ── Processing Loop ─────────────────────────────────────────────────────
     async def _process_loop(self):
         while True:
@@ -243,15 +360,49 @@ class MeshCoreLLMBridge:
                     await self._send(monitor_warn, reply_ch, event)
 
                 mention    = f"@[{sender}] " if sender and sender != "UNKNOWN" else ""
-                bot_prefix = self.cfg.get("bot_prefix", "!bot").lower()
-                ai_prefix  = self.cfg.get("ai_prefix",  "!ai").lower()
+                bot_prefix = str(self.cfg.get("bot_prefix", "!bot") or "").lower()
+                ai_prefix  = str(self.cfg.get("ai_prefix",  "!ai") or "").lower()
                 body_lower = body.lower()
+
+                # ── Detect triggers ─────────────────────────────────────────
+                # Bot: explicit prefix, OR prefix-less only when first word
+                # is a recognised command (avoids capturing every message).
+                bot_triggered = False
+                bot_after     = ""
+                if bot_prefix and body_lower.startswith(bot_prefix):
+                    bot_triggered = True
+                    bot_after = body[len(bot_prefix):].strip()
+                elif not bot_prefix:
+                    _pre_cmd, _ = self.bot.match(body)
+                    if _pre_cmd:
+                        bot_triggered = True
+                        bot_after = body
+
+                ai_triggered = False
+                ai_question = ""
+                if ai_prefix and ai_prefix in body_lower:
+                    ai_triggered = True
+                    pos = body_lower.index(ai_prefix)
+                    ai_question = body[pos + len(ai_prefix):].strip()
+                elif not ai_prefix and body_lower.startswith("!ai"):
+                    # Compatibility fallback when AI prefix field is intentionally blank.
+                    ai_triggered = True
+                    ai_question = body[3:].strip()
+
+                # Mention trigger: supports both @name and @[name]
+                mention_question = self._extract_mention_question(body)
+                mention_triggered = mention_question is not None
+                if mention_triggered:
+                    log.info(
+                        "MENTION DETECTED: sender=%s own='%s' aliases=%s",
+                        sender,
+                        self._own_name,
+                        sorted(self._mention_aliases()),
+                    )
 
                 # ── Per-sender cooldown ─────────────────────────────────────
                 cooldown = float(self.cfg.get("message_cooldown_s", 0))
-                if cooldown > 0 and (
-                    body_lower.startswith(bot_prefix) or ai_prefix in body_lower
-                ):
+                if cooldown > 0 and (bot_triggered or ai_triggered or mention_triggered):
                     last = self._last_reply.get(sender, 0.0)
                     elapsed = time.monotonic() - last
                     if elapsed < cooldown:
@@ -262,9 +413,8 @@ class MeshCoreLLMBridge:
                         continue
 
                 # ── Bot Command ─────────────────────────────────────────────
-                if body_lower.startswith(bot_prefix):
-                    after     = body[len(bot_prefix):].strip()
-                    cmd, args = self.bot.match(after)
+                if bot_triggered:
+                    cmd, args = self.bot.match(bot_after)
                     if cmd:
                         log.info("BOT CMD: %s args='%s' from %s", cmd, args, sender)
                         response = await self.bot.handle(cmd, args, sender, payload, channel)
@@ -274,31 +424,57 @@ class MeshCoreLLMBridge:
                             if delay > 0:
                                 await asyncio.sleep(delay)
                             await self._send_chunked("", response, reply_ch, event)
-                    else:
-                        self._last_reply[sender] = time.monotonic()
-                        await self._send(
-                            f"{mention}unknown command. {self.cfg.get('bot_prefix')} help",
-                            reply_ch, event
-                        )
+                    elif bot_prefix:
+                        # Only send "unknown command" when an explicit prefix was used
+                        if self.cfg.get("reply_unknown_command", True):
+                            self._last_reply[sender] = time.monotonic()
+                            await self._send(
+                                f"{mention}unknown command. {self.cfg.get('bot_prefix')} help",
+                                reply_ch, event
+                            )
                     continue
 
                 # ── LLM Trigger ─────────────────────────────────────────────
-                if ai_prefix in body_lower:
+                if ai_triggered:
                     if not self.cfg.get("ai_enabled", True):
                         log.info("AI DISABLED — ignoring query from %s", sender)
                         continue
-                    pos      = body_lower.index(ai_prefix)
-                    question = body[pos + len(ai_prefix):].strip()
+                    question = ai_question
                     log.info("AI TRIGGER | sender=%s question='%s'", sender, question)
                     self._last_reply[sender] = time.monotonic()
                     await self._handle_llm(sender, question, mention, reply_ch, event, channel)
+                    continue
+
+                # ── Mention Trigger ──────────────────────────────────────────
+                if mention_triggered:
+                    question = mention_question or ""
+                    log.info("MENTION TRIGGER | sender=%s question='%s'", sender, question)
+                    self._last_reply[sender] = time.monotonic()
+                    await self._handle_llm(sender, question, mention, reply_ch, event, channel)
+                    continue
+
+                # ── Proactive AI Trigger ───────────────────────────────────
+                if await self._should_auto_reply(sender, body, channel):
+                    log.info("AUTO AI TRIGGER | sender=%s body='%s'", sender, body)
+                    self._last_reply[sender] = time.monotonic()
+                    await self._handle_llm(
+                        sender,
+                        body,
+                        mention,
+                        reply_ch,
+                        event,
+                        channel,
+                        save_history=False,
+                    )
+                    continue
 
             except Exception as e:
                 log.exception("Error in _process_loop: %s", e)
 
     async def _handle_llm(self, sender, question, mention, reply_ch, orig_event,
-                          channel: int | None = None):
-        ai_prefix = self.cfg.get("ai_prefix", "!ai")
+                          channel: int | None = None,
+                          save_history: bool = True):
+        ai_prefix = str(self.cfg.get("ai_prefix", "!ai") or "").strip()
         q = question.lower()
         try:
             if q in ("reset", "clear", "new"):
@@ -306,38 +482,30 @@ class MeshCoreLLMBridge:
                 await self._send(f"{mention}history cleared.", reply_ch, orig_event)
                 return
             if q in ("help", "pomoc", "?"):
-                await self._send(
-                    f"{mention}{ai_prefix} <question> | {ai_prefix} reset",
-                    reply_ch, orig_event,
-                )
+                if ai_prefix:
+                    help_text = f"{mention}{ai_prefix} <question> | {ai_prefix} reset"
+                else:
+                    help_text = f"{mention}use @[name] <question>"
+                await self._send(help_text, reply_ch, orig_event)
                 return
             if not question:
-                await self._send(f"{mention}type your question after '{ai_prefix}'.", reply_ch, orig_event)
+                await self._send(f"{mention}type your question after trigger.", reply_ch, orig_event)
                 return
 
             # Collect channel context
-            channel_context = None
-            ctx_count = self.cfg.get("channel_context_msgs", 5)
-            if ctx_count > 0 and channel is not None and self.bot:
-                hist = self.bot._chan_history.get(channel)
-                if hist:
-                    bot_pfx = self.cfg.get("bot_prefix", "!bot").lower()
-                    ai_pfx  = self.cfg.get("ai_prefix", "!ai").lower()
-                    context_entries = [
-                        m for m in list(hist)
-                        if not m["text"].lower().startswith(bot_pfx)
-                        and ai_pfx not in m["text"].lower()
-                    ]
-                    if context_entries:
-                        channel_context = context_entries[-ctx_count:]
-                        log.debug("Channel context: %d messages", len(channel_context))
+            channel_context = self._collect_channel_context(channel)
+            if channel_context:
+                log.debug("Channel context: %d messages", len(channel_context))
 
             log.info("LM Studio << %s (context: %s msg)",
                      question, len(channel_context) if channel_context else 0)
             answer = await asyncio.get_event_loop().run_in_executor(
-                None, self.llm.ask, sender, question, channel_context
+                None, self.llm.ask, sender, question, channel_context, save_history
             )
             log.info("LM Studio >> %s", answer[:120])
+            if not answer.strip():
+                log.info("LM Studio returned empty – staying silent")
+                return
             await asyncio.sleep(float(self.cfg.get("reply_delay_s", 0)))
             await self._send_chunked(mention, answer, reply_ch, orig_event)
         except Exception as e:

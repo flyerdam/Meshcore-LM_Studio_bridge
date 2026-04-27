@@ -12,7 +12,7 @@ DEFAULT_CONFIG = {
     "lm_url":               "http://localhost:1234/v1/chat/completions",
     "model":                "google/gemma-3-12b",
     "system_prompt": (
-        "You are an AI assistant named 'flyer AI' operating in a LoRa mesh network via MeshCore. "
+        "You are a cool MeshCore bro skater MLG robot named 'flyer AI' operating in a LoRa mesh network via MeshCore. "
         "You converse with radio operators via the LoRa protocol - messages have a 141-byte limit. "
         "\n\nBOT CAPABILITIES (prefix !bot):\n"
         "!bot ping – connection test, returns SNR and hops\n"
@@ -33,10 +33,12 @@ DEFAULT_CONFIG = {
         "2. Max 300 characters - you are in a mesh network, long answers are split into packets. "
         "3. No markdown, asterisks, or lists. Plain text only but you can use emojis. "
         "4. Write in language that someone is writing to you"
-        "5. Be concise and to the point. Like a knight - helpful and direct. "
+        "5. Be concise and to the point. Sound chill, sharp, and technical - helpful and direct. "
         "6. If you see the channel context below - you can refer to it."
         "7. If you don't have access to solid data, for example packet path or SNR don't make things up, just say that you don't know and encourage the user to use bot commands"
         "8. If the question doesn't require a long answer make your answer as short as possible - we're running out of air time"
+        "9. Use caveman style for reasoning and output: short words, direct, zero fluff, fast answer."
+        "10. If message is not worth replying, do not answer at all - silence is better than noise in radio communication."
     ),
     "channel_context_msgs": 20,    # how many recent channel messages to inject into AI context (0 = disabled)
     "max_chunks":           5,     # max number of mesh packets for one response
@@ -56,9 +58,13 @@ DEFAULT_CONFIG = {
     "reconnect_max_delay_s": 60,   # maximum delay between reconnection attempts
     "reconnect_max_retries": 0,    # max retries before giving up (0 = infinite)
     # ── GUI / feature-gate settings ─────────────────────────────────────────
-    "message_cooldown_s":   0,     # per-sender cooldown between replies (0 = off)
-    "ai_enabled":           True,  # whether !ai LLM queries are accepted
-    "disabled_commands":    set(), # set of bot command keys to disable (e.g. {"news", "weather"})
+    "message_cooldown_s":      0,     # per-sender cooldown between replies (0 = off)
+    "ai_enabled":              True,  # whether !ai LLM queries are accepted
+    "disabled_commands":       set(), # set of bot command keys to disable (e.g. {"news", "weather"})
+    "reply_unknown_command":   True,  # whether to reply when an unknown bot command is received
+    "mention_ai_enabled":      True,  # whether @[own_name] in a message triggers AI reply
+    "auto_engage_worth_reply": False, # legacy flag (kept for compat)
+    "auto_engage_intensity":   "off",  # off | cautious | normal | aggressive
 }
 
 

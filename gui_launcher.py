@@ -519,6 +519,56 @@ class App(ctk.CTk):
             border_color=P.surface2,
         ).pack(anchor="w", padx=12, pady=10)
 
+        self._sec(scroll, "❓", "Unknown Commands")
+
+        self._feat_vars["__reply_unknown__"] = ctk.BooleanVar(value=True)
+        unk_card = ctk.CTkFrame(scroll, fg_color=P.surface0, corner_radius=8)
+        unk_card.pack(fill="x", padx=4, pady=4)
+        ctk.CTkCheckBox(
+            unk_card,
+            text="Reply to unknown command  (sends help hint)",
+            variable=self._feat_vars["__reply_unknown__"],
+            text_color=P.text,
+            checkmark_color=P.base,
+            fg_color=P.blue, hover_color=P.sky,
+            border_color=P.surface2,
+        ).pack(anchor="w", padx=12, pady=10)
+
+        self._sec(scroll, "📣", "Mentions")
+
+        self._feat_vars["__mention_ai__"] = ctk.BooleanVar(value=True)
+        mention_card = ctk.CTkFrame(scroll, fg_color=P.surface0, corner_radius=8)
+        mention_card.pack(fill="x", padx=4, pady=4)
+        ctk.CTkCheckBox(
+            mention_card,
+            text="Reply to @[name] mention with AI",
+            variable=self._feat_vars["__mention_ai__"],
+            text_color=P.text,
+            checkmark_color=P.base,
+            fg_color=P.blue, hover_color=P.sky,
+            border_color=P.surface2,
+        ).pack(anchor="w", padx=12, pady=10)
+
+        self._sec(scroll, "🧠", "Auto Engage")
+
+        auto_card = ctk.CTkFrame(scroll, fg_color=P.surface0, corner_radius=8)
+        auto_card.pack(fill="x", padx=4, pady=4)
+        ctk.CTkLabel(
+            auto_card, text="Reply intensity",
+            text_color=P.text, font=("Segoe UI", 13),
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+        self._vars["auto_engage_intensity"] = ctk.StringVar(value="off")
+        ctk.CTkOptionMenu(
+            auto_card,
+            variable=self._vars["auto_engage_intensity"],
+            values=["off", "cautious", "normal", "aggressive"],
+            fg_color=P.surface1,
+            button_color=P.blue,
+            button_hover_color=P.sky,
+            text_color=P.text,
+            width=160,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
         self._sec(scroll, "🧩", "Bot Commands")
 
         grid = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -708,8 +758,10 @@ class App(ctk.CTk):
         config["baud_rate"]            = int(_get("baud_rate", DEFAULT_CONFIG["baud_rate"]))
         config["lm_url"]               = _get("lm_url")       or DEFAULT_CONFIG["lm_url"]
         config["model"]                = _get("model")        or DEFAULT_CONFIG["model"]
-        config["ai_prefix"]            = _get("ai_prefix")    or DEFAULT_CONFIG["ai_prefix"]
-        config["bot_prefix"]           = _get("bot_prefix")   or DEFAULT_CONFIG["bot_prefix"]
+        ai_prefix_val = _get("ai_prefix", DEFAULT_CONFIG["ai_prefix"])
+        bot_prefix_val = _get("bot_prefix", DEFAULT_CONFIG["bot_prefix"])
+        config["ai_prefix"]            = ai_prefix_val if ai_prefix_val is not None else DEFAULT_CONFIG["ai_prefix"]
+        config["bot_prefix"]           = bot_prefix_val if bot_prefix_val is not None else DEFAULT_CONFIG["bot_prefix"]
         config["message_cooldown_s"]   = float(_get("message_cooldown_s", 0))
         config["reply_delay_s"]        = float(_get("reply_delay_s",
                                                     DEFAULT_CONFIG["reply_delay_s"]))
@@ -734,6 +786,13 @@ class App(ctk.CTk):
 
         config["ai_enabled"] = self._feat_vars.get(
             "__ai__", ctk.BooleanVar(value=True)).get()
+        config["reply_unknown_command"] = self._feat_vars.get(
+            "__reply_unknown__", ctk.BooleanVar(value=True)).get()
+        config["mention_ai_enabled"] = self._feat_vars.get(
+            "__mention_ai__", ctk.BooleanVar(value=True)).get()
+        config["auto_engage_intensity"] = self._vars.get(
+            "auto_engage_intensity", ctk.StringVar(value="off")).get()
+        config["auto_engage_worth_reply"] = config["auto_engage_intensity"] != "off"
         disabled: set[str] = set()
         for key, _ in BOT_FEATURES:
             if not self._feat_vars.get(key, ctk.BooleanVar(value=True)).get():

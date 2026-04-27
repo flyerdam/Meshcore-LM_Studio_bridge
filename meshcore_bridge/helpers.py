@@ -48,6 +48,25 @@ def strip_think_tags(text: str) -> str:
     return text.strip()
 
 
+def strip_tool_artifacts(text: str) -> str:
+    """Remove tool-call/control-token artifacts leaked by some models."""
+    if not text:
+        return ""
+
+    cleaned = text
+
+    # Remove OpenAI-style control token fragments.
+    cleaned = re.sub(r"<\|[^|]+\|>", "", cleaned)
+
+    # Remove common tool-call envelopes seen in bad model outputs.
+    cleaned = re.sub(r"commentary\s+to=[^\n]+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\{\s*\"path\"\s*:[^\n]*\}", "", cleaned)
+
+    # Collapse whitespace leftovers.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def fit_to_bytes(text: str, limit: int = BYTE_LIMIT) -> str:
     """Truncate *text* so its UTF-8 encoding fits within *limit* bytes."""
     encoded = text.encode("utf-8")
