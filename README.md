@@ -22,6 +22,8 @@ Mesh users can chat with an AI, fetch live internet data (weather, news, web sea
 
 ---
 
+> **Hardware note:** Only tested on a **Heltec LoRa 32 V3**. Other MeshCore-compatible boards may work but are untested. YMMV.
+
 ## Quick Start
 
 **Prerequisites:** Python 3.10+, LoRa radio on USB/Serial, LLM backend (local or cloud).
