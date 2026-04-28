@@ -19,6 +19,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 from types import SimpleNamespace
@@ -43,7 +44,46 @@ except ImportError:
     def _get_serial_ports() -> list[str]:
         return []
 
-from meshcore_bridge.config import DEFAULT_CONFIG
+# Optional: OSM map widget
+try:
+    import tkintermapview
+    from PIL import Image, ImageDraw, ImageTk as _ImageTk
+    _HAS_MAPVIEW = True
+except ImportError:
+    _HAS_MAPVIEW = False
+
+_TILE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tile_cache.db")
+_marker_icon_cache: dict = {}  # color_hex -> tk.PhotoImage (kept alive here)
+
+
+def _make_marker_icon(color_hex: str, size: int = 30) -> "tk.PhotoImage":
+    """Create a glossy circular marker icon as a tkinter PhotoImage."""
+    try:
+        r, g, b = int(color_hex[1:3], 16), int(color_hex[3:5], 16), int(color_hex[5:7], 16)
+    except Exception:
+        r, g, b = 200, 200, 200
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Drop shadow
+    draw.ellipse([2, 3, size - 1, size], fill=(0, 0, 0, 90))
+    # Black outline
+    draw.ellipse([0, 0, size - 4, size - 4], fill=(20, 20, 20, 255))
+    # Colored fill
+    inset = 3
+    draw.ellipse([inset, inset, size - 4 - inset, size - 4 - inset], fill=(r, g, b, 255))
+    # Glossy highlight top-left
+    hi = max(4, size // 5)
+    draw.ellipse([inset + 2, inset + 2, inset + 2 + hi, inset + 2 + hi],
+                 fill=(255, 255, 255, 140))
+    return _ImageTk.PhotoImage(img)
+
+from meshcore_bridge.config import (
+    DEFAULT_CONFIG,
+    DEFAULT_GITHUB_MODELS_URL,
+    DEFAULT_OPENAI_COMPAT_URL,
+    load_persisted_config,
+    save_user_config,
+)
 from meshcore_bridge.bridge import MeshCoreLLMBridge
 
 log = logging.getLogger(__name__)
@@ -92,9 +132,8 @@ BOT_FEATURES: list[tuple[str, str]] = [
 ]
 
 # Persistence & constants
-_CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "bridge_gui_config.json")
-_STOP_TIMEOUT = 10   # seconds to wait for clean shutdown
+_STOP_TIMEOUT       = 10            # seconds to wait for clean shutdown
+_DISCOVERIES_FILE   = "discoveries.json"
 
 
 # ── Log queue handler ─────────────────────────────────────────────────────────
@@ -125,9 +164,10 @@ class _BridgeRunner(threading.Thread):
     bridge.serial.disconnect() is called → COM port is released cleanly.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, map_queue: queue.Queue):
         super().__init__(daemon=True, name="bridge-thread")
         self.config = config
+        self._map_queue = map_queue
         self.error: Exception | None = None
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -165,7 +205,7 @@ class _BridgeRunner(threading.Thread):
             self._stopped.set()
 
     async def _async_main(self):
-        bridge = MeshCoreLLMBridge(self.config)
+        bridge = MeshCoreLLMBridge(self.config, map_queue=self._map_queue)
         try:
             await bridge.run()
         except asyncio.CancelledError:
@@ -234,6 +274,140 @@ class _CTkSpinbox(ctk.CTkFrame):
         self._var.set(self._fmt.format(max(self._from, v - self._increment)))
 
 
+# ── API Keys popup ────────────────────────────────────────────────────────────
+
+class _APIKeysDialog(ctk.CTkToplevel):
+    """Modal popup for editing provider API keys."""
+
+    def __init__(self, parent, provider_vars: dict[str, ctk.StringVar]):
+        super().__init__(parent)
+        self.title("API Keys")
+        self.geometry("480x320")
+        self.resizable(False, False)
+        self.grab_set()  # modal
+        self.focus_force()
+        self.configure(fg_color=P.mantle)
+        self._vars = provider_vars
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Provider API Keys",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=P.text).pack(pady=(16, 4), padx=20, anchor="w")
+        ctk.CTkLabel(self, text="Keys stored in bridge_config.user.json (local, never synced)",
+                     font=ctk.CTkFont(size=10), text_color=P.overlay0).pack(padx=20, anchor="w")
+
+        frame = ctk.CTkFrame(self, fg_color=P.base, corner_radius=8)
+        frame.pack(fill="both", expand=True, padx=16, pady=12)
+        frame.grid_columnconfigure(1, weight=1)
+
+        labels = {
+            "llm_api_key":      ("Main LLM",   "GITHUB_TOKEN / LLM_API_KEY / OPENAI_API_KEY (env fallback)"),
+            "local_gate_api_key": ("Gate LLM", "Leave blank for local servers (LM Studio, Ollama)"),
+        }
+        for row_idx, (key, (label, hint)) in enumerate(labels.items()):
+            ctk.CTkLabel(frame, text=label, text_color=P.subtext,
+                         font=ctk.CTkFont(size=12),
+                         width=100, anchor="w").grid(row=row_idx * 2, column=0,
+                                                      padx=12, pady=(10, 2), sticky="w")
+            var = self._vars.get(key, ctk.StringVar())
+            entry = ctk.CTkEntry(frame, textvariable=var, show="●",
+                                 fg_color=P.surface0, text_color=P.text,
+                                 border_width=0, height=32)
+            entry.grid(row=row_idx * 2, column=1, padx=(4, 12), pady=(10, 2), sticky="ew")
+            ctk.CTkLabel(frame, text=f"   {hint}",
+                         text_color=P.overlay0,
+                         font=ctk.CTkFont(size=10),
+                         wraplength=300, justify="left").grid(
+                row=row_idx * 2 + 1, column=0, columnspan=2,
+                padx=12, pady=(0, 4), sticky="w")
+
+        ctk.CTkButton(self, text="Close", width=100, height=32,
+                      fg_color=P.blue, hover_color=P.sky, text_color=P.base,
+                      command=self.destroy).pack(pady=(0, 14))
+
+
+# ── Add / Edit Provider popup ─────────────────────────────────────────────────
+
+class _AddProviderDialog(ctk.CTkToplevel):
+    """Modal popup for adding a custom provider preset."""
+
+    def __init__(self, parent, on_save):
+        super().__init__(parent)
+        self.title("Add Provider")
+        self.geometry("480x340")
+        self.resizable(False, False)
+        self.grab_set()
+        self.focus_force()
+        self.configure(fg_color=P.mantle)
+        self._on_save = on_save
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Add Custom Provider",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=P.text).pack(pady=(16, 4), padx=20, anchor="w")
+        ctk.CTkLabel(self, text="Saved as a preset — appears in the Provider dropdown",
+                     font=ctk.CTkFont(size=10), text_color=P.overlay0).pack(padx=20, anchor="w")
+
+        frame = ctk.CTkFrame(self, fg_color=P.base, corner_radius=8)
+        frame.pack(fill="both", expand=True, padx=16, pady=12)
+        frame.grid_columnconfigure(1, weight=1)
+
+        fields = [
+            ("name",     "Display Name",  "e.g. Ollama",                          False),
+            ("url",      "API URL",       "e.g. http://localhost:11434/v1/chat/completions", False),
+            ("model",    "Default Model", "e.g. llama3",                          False),
+        ]
+        self._field_vars: dict[str, ctk.StringVar] = {}
+        for row_idx, (key, label, placeholder, masked) in enumerate(fields):
+            ctk.CTkLabel(frame, text=label, text_color=P.subtext,
+                         font=ctk.CTkFont(size=12),
+                         width=120, anchor="w").grid(row=row_idx, column=0,
+                                                      padx=12, pady=8, sticky="w")
+            var = ctk.StringVar()
+            self._field_vars[key] = var
+            entry = ctk.CTkEntry(frame, textvariable=var,
+                                 show="●" if masked else "",
+                                 placeholder_text=placeholder,
+                                 fg_color=P.surface0, text_color=P.text,
+                                 border_width=0, height=32)
+            entry.grid(row=row_idx, column=1, padx=(4, 12), pady=8, sticky="ew")
+
+        self._api_type_var = ctk.StringVar(value="openai_compat")
+        ctk.CTkLabel(frame, text="API Type", text_color=P.subtext,
+                     font=ctk.CTkFont(size=12),
+                     width=120, anchor="w").grid(row=3, column=0, padx=12, pady=8, sticky="w")
+        ctk.CTkOptionMenu(frame, variable=self._api_type_var,
+                          values=["openai_compat", "github_models"],
+                          fg_color=P.surface0, button_color=P.blue,
+                          button_hover_color=P.sky, text_color=P.text,
+                          width=220).grid(row=3, column=1, padx=(4, 12), pady=8, sticky="w")
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(pady=(0, 14))
+        ctk.CTkButton(btn_row, text="Cancel", width=100, height=32,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.text, command=self.destroy).pack(side="left", padx=6)
+        ctk.CTkButton(btn_row, text="Save", width=100, height=32,
+                      fg_color=P.blue, hover_color=P.sky,
+                      text_color=P.base, command=self._save).pack(side="left", padx=6)
+
+    def _save(self):
+        name = self._field_vars["name"].get().strip()
+        url  = self._field_vars["url"].get().strip()
+        model = self._field_vars["model"].get().strip()
+        if not name or not url:
+            return
+        self._on_save({
+            "name":     name,
+            "url":      url,
+            "model":    model or "",
+            "api_type": self._api_type_var.get(),
+        })
+        self.destroy()
+
+
 # ── Main application ──────────────────────────────────────────────────────────
 
 class App(ctk.CTk):
@@ -246,9 +420,20 @@ class App(ctk.CTk):
 
         self._runner: _BridgeRunner | None = None
         self._log_queue: queue.Queue       = queue.Queue()
+        self._map_queue:  queue.Queue      = queue.Queue(maxsize=500)
 
         self._vars:      dict[str, tk.Variable] = {}
         self._feat_vars: dict[str, ctk.BooleanVar] = {}
+
+        # Custom provider presets added by user: list[{name, url, model, api_type}]
+        self._custom_providers: list[dict] = []
+
+        # Per-provider last-used model: {provider_name: model_str}
+        self._provider_models:   dict[str, str] = {}
+        self._gate_models:       dict[str, str] = {}
+
+        # Discovery map: {callsign: {lat, lon, name, snr, last_seen}}
+        self._map_nodes: dict[str, dict] = {}
 
         # Animation state
         self._pulse_phase   = 0.0
@@ -257,7 +442,9 @@ class App(ctk.CTk):
         self._build_ui()
         self._setup_logging()
         self._load_settings()
+        self._map_nodes_load()
         self._poll_log()
+        self._poll_map_queue()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -270,7 +457,7 @@ class App(ctk.CTk):
 
         self._build_topbar()
         self._build_settings_panel()
-        self._build_console_panel()
+        self._build_right_panel()
         self._build_bottombar()
 
     # ── Top bar ───────────────────────────────────────────────────────────────
@@ -320,16 +507,18 @@ class App(ctk.CTk):
             segmented_button_unselected_hover_color=P.surface1,
             text_color=P.text,
             text_color_disabled=P.overlay0,
+            command=self._on_tab_changed,
         )
         self._tab.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        for name in ("Connection", "Commands", "Timing", "Features"):
+        for name in ("Connection", "Commands", "Timing", "Features", "Nodes"):
             self._tab.add(name)
 
         self._build_tab_connection(self._tab.tab("Connection"))
         self._build_tab_commands(self._tab.tab("Commands"))
         self._build_tab_timing(self._tab.tab("Timing"))
         self._build_tab_features(self._tab.tab("Features"))
+        self._build_tab_map(self._tab.tab("Nodes"))
 
     # ── shared helpers ────────────────────────────────────────────────────────
 
@@ -355,6 +544,96 @@ class App(ctk.CTk):
         ctk.CTkLabel(parent, text=f"   {text}",
                      text_color=P.overlay0,
                      font=ctk.CTkFont(size=10)).pack(anchor="w", padx=8)
+
+    # Provider → (url, model, api_key_hint)
+    _PROVIDER_DEFAULTS: dict[str, tuple[str, str, str]] = {
+        "openai_compat": (
+            DEFAULT_OPENAI_COMPAT_URL,
+            DEFAULT_CONFIG["model"],
+            "Optional — leave blank for LM Studio and most local servers",
+        ),
+        "github_models": (
+            DEFAULT_GITHUB_MODELS_URL,
+            "openai/gpt-4.1",
+            "Required — GitHub Personal Access Token with models:read scope",
+        ),
+    }
+
+    def _apply_llm_preset(self, provider: str,
+                          url_key: str = "lm_url",
+                          model_key: str = "model",
+                          provider_key: str = "llm_provider",
+                          api_key_hint_widget: str = "_api_key_hint",
+                          per_provider_store: str = "_provider_models"):
+        provider_var = self._vars.get(provider_key)
+        url_var      = self._vars.get(url_key)
+        model_var    = self._vars.get(model_key)
+        if not url_var or not model_var:
+            return
+        if provider_var:
+            provider_var.set(provider)
+
+        defaults = self._PROVIDER_DEFAULTS.get(provider)
+        if defaults:
+            url_default, model_default, key_hint = defaults
+            url_var.set(url_default)
+            # Restore the last model the user used with this provider
+            store: dict = getattr(self, per_provider_store, {})
+            stored_model = store.get(provider, "").strip()
+            model_var.set(stored_model if stored_model else model_default)
+            hint_widget = getattr(self, api_key_hint_widget, None)
+            if hint_widget:
+                hint_widget.configure(text=f"   {key_hint}")
+
+    def _on_provider_changed(self, provider: str):
+        # Save current model under the old provider before switching
+        old = self._vars.get("llm_provider")  # already updated to new
+        # old == provider now, so we track via model trace in _on_model_edited
+        self._apply_llm_preset(
+            provider,
+            url_key="lm_url", model_key="model",
+            provider_key="llm_provider",
+            api_key_hint_widget="_api_key_hint",
+            per_provider_store="_provider_models",
+        )
+
+    def _on_gate_provider_changed(self, provider: str):
+        self._apply_llm_preset(
+            provider,
+            url_key="local_gate_url", model_key="local_gate_model",
+            provider_key="local_gate_provider",
+            api_key_hint_widget="_gate_api_key_hint",
+            per_provider_store="_gate_models",
+        )
+
+    def _on_model_edited(self, *_args):
+        """Keep _provider_models in sync whenever the model entry changes."""
+        prov_var = self._vars.get("llm_provider")
+        model_var = self._vars.get("model")
+        if prov_var and model_var:
+            self._provider_models[prov_var.get()] = model_var.get()
+
+    def _on_gate_model_edited(self, *_args):
+        prov_var = self._vars.get("local_gate_provider")
+        model_var = self._vars.get("local_gate_model")
+        if prov_var and model_var:
+            self._gate_models[prov_var.get()] = model_var.get()
+
+    _INTENSITY_HINTS: dict[str, str] = {
+        "off":        "Auto-engage disabled. Bridge only responds to explicit !ai or !bot commands and @mentions.",
+        "minimal":    "Fires only when message contains an AI keyword (ai / sztuczna / intelig) AND local LLM confirms it's worth replying. Most messages ignored.",
+        "keyword":    "Keyword-driven: replies when message has '?', the word 'ai/bot/robot', or bot-address. No LLM call — instant and free.",
+        "normal":     "Local LLM reads every message and decides YES/NO. Best balance. Uses local gate backend (configure in Connection tab).",
+        "aggressive": "Replies to almost all non-trivial messages. No LLM call needed — just fires. Use with message cooldown to avoid spam.",
+    }
+
+    def _on_intensity_changed(self, value: str):
+        self._update_intensity_hint(value)
+
+    def _update_intensity_hint(self, value: str):
+        hint = self._INTENSITY_HINTS.get(value, "")
+        if hasattr(self, "_intensity_hint"):
+            self._intensity_hint.configure(text=hint)
 
     # ── Tab: Connection ───────────────────────────────────────────────────────
 
@@ -388,7 +667,30 @@ class App(ctk.CTk):
                     variable=self._vars["baud_rate"], width=160).grid(
             row=0, column=1, sticky="w")
 
-        self._sec(scroll, "🤖", "LM Studio")
+        self._sec(scroll, "🤖", "LLM Backend")
+
+        self._vars["llm_provider"] = ctk.StringVar(value=DEFAULT_CONFIG["llm_provider"])
+        row = self._row(scroll, "Provider")
+        prov_inner = ctk.CTkFrame(row, fg_color="transparent")
+        prov_inner.grid(row=0, column=1, sticky="w")
+        self._provider_menu = ctk.CTkOptionMenu(
+            prov_inner,
+            variable=self._vars["llm_provider"],
+            values=["openai_compat", "github_models"],
+            command=self._on_provider_changed,
+            fg_color=P.surface0,
+            button_color=P.blue,
+            button_hover_color=P.sky,
+            text_color=P.text,
+            width=200,
+        )
+        self._provider_menu.pack(side="left")
+        ctk.CTkButton(prov_inner, text="+", width=30, height=28,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.text, corner_radius=6,
+                      command=self._open_add_provider_dialog).pack(side="left", padx=(6, 0))
+        self._hint(scroll, "openai_compat = LM Studio, Ollama, any OpenAI-compatible server")
+        self._hint(scroll, "github_models = GitHub Models marketplace (requires PAT with models:read)")
 
         self._vars["lm_url"] = ctk.StringVar(value=DEFAULT_CONFIG["lm_url"])
         row = self._row(scroll, "API URL")
@@ -397,20 +699,73 @@ class App(ctk.CTk):
                      border_width=0).grid(row=0, column=1, sticky="ew")
 
         self._vars["model"] = ctk.StringVar(value=DEFAULT_CONFIG["model"])
+        self._vars["model"].trace_add("write", self._on_model_edited)
         row = self._row(scroll, "Model Name")
         ctk.CTkEntry(row, textvariable=self._vars["model"],
                      fg_color=P.surface0, text_color=P.text,
                      border_width=0).grid(row=0, column=1, sticky="ew")
+        self._hint(scroll, "Switching provider restores the last model you used for that provider")
+
+        # Keep vars for _collect_config but show only button
+        self._vars["llm_api_key"] = ctk.StringVar(value="")
+        self._vars["local_gate_api_key"] = ctk.StringVar(value="")
+        row = self._row(scroll, "API Keys")
+        ctk.CTkButton(row, text="🔑  Manage API Keys", height=30, width=170,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.text, corner_radius=6,
+                      command=self._open_api_keys_dialog).grid(row=0, column=1, sticky="w")
+
+        self._sec(scroll, "🧠", "Local Auto-Gate Backend")
+
+        self._vars["local_gate_provider"] = ctk.StringVar(
+            value=DEFAULT_CONFIG.get("local_gate_provider", "openai_compat")
+        )
+        row = self._row(scroll, "Gate Provider")
+        gate_inner = ctk.CTkFrame(row, fg_color="transparent")
+        gate_inner.grid(row=0, column=1, sticky="w")
+        self._gate_provider_menu = ctk.CTkOptionMenu(
+            gate_inner,
+            variable=self._vars["local_gate_provider"],
+            values=["openai_compat", "github_models"],
+            command=self._on_gate_provider_changed,
+            fg_color=P.surface0,
+            button_color=P.blue,
+            button_hover_color=P.sky,
+            text_color=P.text,
+            width=200,
+        )
+        self._gate_provider_menu.pack(side="left")
+
+        self._vars["local_gate_url"] = ctk.StringVar(
+            value=DEFAULT_CONFIG.get("local_gate_url", DEFAULT_OPENAI_COMPAT_URL)
+        )
+        row = self._row(scroll, "Gate URL")
+        ctk.CTkEntry(row, textvariable=self._vars["local_gate_url"],
+                     fg_color=P.surface0, text_color=P.text,
+                     border_width=0).grid(row=0, column=1, sticky="ew")
+
+        self._vars["local_gate_model"] = ctk.StringVar(
+            value=DEFAULT_CONFIG.get("local_gate_model", DEFAULT_CONFIG["model"])
+        )
+        self._vars["local_gate_model"].trace_add("write", self._on_gate_model_edited)
+        row = self._row(scroll, "Gate Model")
+        ctk.CTkEntry(row, textvariable=self._vars["local_gate_model"],
+                     fg_color=P.surface0, text_color=P.text,
+                     border_width=0).grid(row=0, column=1, sticky="ew")
+        self._hint(scroll, "Used only when local-gate toggle is enabled in Features → Auto Engage")
+        self._hint(scroll, "Gate API key is managed via the 🔑 Manage API Keys button above")
 
         self._sec(scroll, "🔗", "News API (optional)")
 
         self._vars["news_api_key"] = ctk.StringVar(value="")
         row = self._row(scroll, "API Key")
-        ctk.CTkEntry(row, textvariable=self._vars["news_api_key"],
-                     show="\u25cf",
-                     fg_color=P.surface0, text_color=P.text,
-                     border_width=0).grid(row=0, column=1, sticky="ew")
-        self._hint(scroll, "newsapi.org key  (leave blank for DuckDuckGo only)")
+        btn_inner = ctk.CTkFrame(row, fg_color="transparent")
+        btn_inner.grid(row=0, column=1, sticky="w")
+        ctk.CTkButton(btn_inner, text="🔑  Manage API Keys", height=28, width=170,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.text, corner_radius=6,
+                      command=self._open_api_keys_dialog).pack(side="left")
+        self._hint(scroll, "newsapi.org key + provider keys — all in one popup")
 
     # ── Tab: Commands ─────────────────────────────────────────────────────────
 
@@ -481,6 +836,30 @@ class App(ctk.CTk):
                     variable=self._vars["channel_context_msgs"],
                     width=160).grid(row=0, column=1, sticky="w")
         self._hint(scroll, "recent messages injected into AI context  (0 = off)")
+
+        self._sec(scroll, "🪙", "Token Safety")
+
+        self._vars["token_budget_total"] = ctk.IntVar(
+            value=DEFAULT_CONFIG.get("token_budget_total", 0))
+        row = self._row(scroll, "Session Total Budget")
+        _CTkSpinbox(row, from_=0, to=500000, increment=100,
+                    variable=self._vars["token_budget_total"],
+                    width=160).grid(row=0, column=1, sticky="w")
+
+        self._vars["token_budget_prompt"] = ctk.IntVar(
+            value=DEFAULT_CONFIG.get("token_budget_prompt", 0))
+        row = self._row(scroll, "Prompt Token Budget")
+        _CTkSpinbox(row, from_=0, to=500000, increment=100,
+                    variable=self._vars["token_budget_prompt"],
+                    width=160).grid(row=0, column=1, sticky="w")
+
+        self._vars["token_budget_completion"] = ctk.IntVar(
+            value=DEFAULT_CONFIG.get("token_budget_completion", 0))
+        row = self._row(scroll, "Completion Token Budget")
+        _CTkSpinbox(row, from_=0, to=500000, increment=100,
+                    variable=self._vars["token_budget_completion"],
+                    width=160).grid(row=0, column=1, sticky="w")
+        self._hint(scroll, "0 = unlimited. Bridge stops LLM calls when budget is exhausted")
 
         self._sec(scroll, "⏰", "Background Tasks")
 
@@ -561,13 +940,35 @@ class App(ctk.CTk):
         ctk.CTkOptionMenu(
             auto_card,
             variable=self._vars["auto_engage_intensity"],
-            values=["off", "cautious", "normal", "aggressive"],
+            values=["off", "minimal", "keyword", "normal", "aggressive"],
+            command=self._on_intensity_changed,
             fg_color=P.surface1,
             button_color=P.blue,
             button_hover_color=P.sky,
             text_color=P.text,
             width=160,
-        ).pack(anchor="w", padx=12, pady=(0, 10))
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+        self._intensity_hint = ctk.CTkLabel(
+            auto_card, text="",
+            text_color=P.overlay0, font=ctk.CTkFont(size=10),
+            wraplength=320, justify="left",
+        )
+        self._intensity_hint.pack(anchor="w", padx=12, pady=(0, 8))
+        self._update_intensity_hint("off")
+
+        self._feat_vars["__local_gate__"] = ctk.BooleanVar(
+            value=bool(DEFAULT_CONFIG.get("local_gate_enabled", False))
+        )
+        ctk.CTkCheckBox(
+            auto_card,
+            text="Use local LLM only for auto-engage decision",
+            variable=self._feat_vars["__local_gate__"],
+            text_color=P.text,
+            checkmark_color=P.base,
+            fg_color=P.blue, hover_color=P.sky,
+            border_color=P.surface2,
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+        self._hint(auto_card, "When enabled: gate uses local_gate_* config, final replies still use main provider")
 
         self._sec(scroll, "🧩", "Bot Commands")
 
@@ -589,29 +990,327 @@ class App(ctk.CTk):
                 border_color=P.surface2,
             ).pack(anchor="w", padx=10, pady=8)
 
+    # ── Tab: Map ──────────────────────────────────────────────────────────────
+
+    def _build_tab_map(self, tab):
+        """Sidebar Map tab: shows heard-node list sorted by last seen."""
+        top = ctk.CTkFrame(tab, fg_color="transparent")
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(top, text="📡  Heard Nodes",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=P.blue).pack(side="left")
+        self._map_count_label = ctk.CTkLabel(top, text="0 nodes",
+                                             font=ctk.CTkFont(size=11),
+                                             text_color=P.overlay0)
+        self._map_count_label.pack(side="right", padx=4)
+        ctk.CTkButton(top, text="Clear", width=60, height=26,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.text, corner_radius=6,
+                      command=self._map_clear).pack(side="right", padx=4)
+
+        self._node_list_frame = ctk.CTkScrollableFrame(
+            tab, fg_color=P.base, corner_radius=8)
+        self._node_list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def _map_clear(self):
+        self._map_nodes.clear()
+        self._node_list_update()
+        # Remove all markers from the live map
+        if _HAS_MAPVIEW and hasattr(self, "_map_markers"):
+            for m in self._map_markers.values():
+                try:
+                    m.delete()
+                except Exception:
+                    pass
+            self._map_markers.clear()
+        self._map_nodes_save()
+
+    def _map_redraw(self):
+        """No-op: replaced by tkintermapview markers."""
+        pass
+
+    def _map_refresh_all_markers(self):
+        """Place/update all GPS nodes as markers on the tkintermapview."""
+        if not _HAS_MAPVIEW or not getattr(self, "_mapview_ready", False) or not hasattr(self, "_mapview"):
+            return
+        for cs, nd in self._map_nodes.items():
+            self._map_place_marker(cs, nd)
+
+    def _map_place_marker(self, callsign: str, nd: dict):
+        """Add or update a single marker on the map for the given node."""
+        if not _HAS_MAPVIEW or not getattr(self, "_mapview_ready", False) or not hasattr(self, "_mapview"):
+            return
+        lat = nd.get("lat")
+        lon = nd.get("lon")
+        if not lat or not lon or (abs(lat) < 0.001 and abs(lon) < 0.001):
+            return
+        node_type = nd.get("node_type", None)
+        if node_type == 2:
+            color = P.teal
+        elif node_type == 1:
+            color = P.mauve
+        else:
+            color = P.text
+        snr = nd.get("snr", "")
+        snr_str = f" {snr}dB" if snr != "" else ""
+        label = f"{callsign}{snr_str}"
+        # Build or reuse cached PIL icon for this color
+        if _HAS_MAPVIEW and color not in _marker_icon_cache:
+            _marker_icon_cache[color] = _make_marker_icon(color)
+        icon = _marker_icon_cache.get(color)
+        # Remove old marker if exists
+        old = self._map_markers.get(callsign)
+        if old is not None:
+            try:
+                old.delete()
+            except Exception:
+                pass
+        try:
+            marker = self._mapview.set_marker(
+                lat, lon,
+                text=label,
+                icon=icon,
+                icon_anchor="center",
+                text_color="#111111",
+                font=("Consolas", 10, "bold"),
+            )
+            self._map_markers[callsign] = marker
+        except Exception:
+            pass
+
+    def _map_on_hover(self, event):
+        """No-op: tkintermapview handles tooltips natively."""
+        pass
+
+
+    def _poll_map_queue(self):
+        changed = False
+        try:
+            while True:
+                item = self._map_queue.get_nowait()
+                callsign = item.get("callsign", "?")
+                kind = item.get("kind", "advert")
+                if kind == "advert":
+                    self._map_nodes[callsign] = item
+                    changed = True
+                else:
+                    # contact-only: update last_seen, preserve position
+                    existing = self._map_nodes.get(callsign, {})
+                    existing["callsign"] = callsign
+                    existing["last_seen"] = item.get("last_seen", time.time())
+                    if item.get("snr", "") != "":
+                        existing["snr"] = item["snr"]
+                    if item.get("node_type") is not None:
+                        existing["node_type"] = item["node_type"]
+                    self._map_nodes[callsign] = existing
+                    changed = True
+        except queue.Empty:
+            pass
+        if changed:
+            self._node_list_update()
+            self._map_nodes_save()
+            # Update live map markers for all changed nodes with GPS
+            if _HAS_MAPVIEW and getattr(self, "_mapview_ready", False) and hasattr(self, "_mapview"):
+                for cs, nd in self._map_nodes.items():
+                    if nd.get("lat") and nd.get("lon"):
+                        self._map_place_marker(cs, nd)
+        self.after(2000, self._poll_map_queue)
+
+    def _node_list_update(self):
+        """Rebuild the sidebar node list sorted by last_seen descending."""
+        if not hasattr(self, "_node_list_frame"):
+            return
+        frame = self._node_list_frame
+        for w in frame.winfo_children():
+            w.destroy()
+        now = time.time()
+        sorted_nodes = sorted(
+            self._map_nodes.items(),
+            key=lambda kv: kv[1].get("last_seen", 0),
+            reverse=True,
+        )
+        self._map_count_label.configure(
+            text=f"{len(sorted_nodes)} node{'s' if len(sorted_nodes) != 1 else ''}"
+        )
+        for cs, nd in sorted_nodes:
+            # Color row by node type: 2=repeater (teal), 1=companion (mauve+bold), else default
+            node_type = nd.get("node_type", None)
+            if node_type == 2:
+                name_color = P.teal
+                type_icon  = "🔁 "
+                name_font  = ctk.CTkFont(size=12, weight="bold")
+            elif node_type == 1:
+                name_color = P.mauve
+                type_icon  = "📱 "
+                name_font  = ctk.CTkFont(size=12, weight="bold", slant="italic")
+            else:
+                name_color = P.text
+                type_icon  = ""
+                name_font  = ctk.CTkFont(size=12, weight="bold")
+            row = ctk.CTkFrame(frame, fg_color=P.surface0, corner_radius=6)
+            row.pack(fill="x", padx=4, pady=2)
+            row.columnconfigure(1, weight=1)
+            # Click: zoom to node on map
+            _cs = cs  # capture for closure
+            _bind = lambda _e, c=_cs: self._map_zoom_to(c)
+            row.bind("<Button-1>", _bind)
+            # Hover: highlight row
+            def _enter(e, r=row): r.configure(fg_color=P.surface1)
+            def _leave(e, r=row):
+                under = r.winfo_containing(e.x_root, e.y_root)
+                try:
+                    if under and str(under).startswith(str(r)):
+                        return
+                except Exception:
+                    pass
+                r.configure(fg_color=P.surface0)
+            row.bind("<Enter>", _enter)
+            row.bind("<Leave>", _leave)
+            age_s = int(now - nd.get("last_seen", now))
+            if age_s < 60:
+                age_str = f"{age_s}s ago"
+            elif age_s < 3600:
+                age_str = f"{age_s // 60}m ago"
+            else:
+                age_str = f"{age_s // 3600}h ago"
+            lat = nd.get("lat")
+            lon = nd.get("lon")
+            pos_str = (f"{lat:.4f}, {lon:.4f}"
+                       if (lat and lon and (abs(lat) > 0.001 or abs(lon) > 0.001))
+                       else "no GPS")
+            snr = nd.get("snr", "")
+            snr_str = f" · {snr}dB" if snr != "" else ""
+            lbl_name = ctk.CTkLabel(row, text=f"{type_icon}{cs}",
+                         font=name_font,
+                         text_color=name_color, anchor="w")
+            lbl_name.grid(row=0, column=0, padx=(8, 4), pady=4, sticky="w")
+            lbl_pos = ctk.CTkLabel(row,
+                         text=f"{pos_str}{snr_str}",
+                         font=ctk.CTkFont(size=10),
+                         text_color=P.overlay1, anchor="w")
+            lbl_pos.grid(row=1, column=0, padx=(8, 4), pady=(0, 4), sticky="w")
+            lbl_age = ctk.CTkLabel(row, text=age_str,
+                         font=ctk.CTkFont(size=10),
+                         text_color=P.overlay0, anchor="e")
+            lbl_age.grid(row=0, column=1, padx=(4, 8), pady=4, sticky="e", rowspan=2)
+            # Bind all child widgets so click + hover anywhere on row works
+            for widget in (lbl_name, lbl_pos, lbl_age):
+                widget.bind("<Button-1>", _bind)
+                widget.bind("<Enter>", _enter)
+                widget.bind("<Leave>", _leave)
+
+    def _map_zoom_to(self, callsign: str):
+        """Switch to Map tab and zoom to the node's position."""
+        self._right_tabs.set("Map")
+        self._init_mapview_lazy()
+        nd = self._map_nodes.get(callsign, {})
+        lat, lon = nd.get("lat"), nd.get("lon")
+        if lat and lon and (abs(lat) > 0.001 or abs(lon) > 0.001):
+            self.after(200, lambda: (
+                self._mapview.set_position(lat, lon),
+                self._mapview.set_zoom(13),
+            ))
+
+    def _map_nodes_save(self):
+        """Persist current discoveries to JSON."""
+        try:
+            data: dict = {}
+            for cs, nd in self._map_nodes.items():
+                data[cs] = {k: v for k, v in nd.items() if k != "kind"}
+            with open(_DISCOVERIES_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"nodes": data, "saved": time.time()}, fh, indent=2)
+        except Exception as exc:
+            log.debug("discoveries save failed: %s", exc)
+
+    def _map_nodes_load(self):
+        """Restore discoveries from JSON on startup."""
+        try:
+            with open(_DISCOVERIES_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+            for cs, nd in data.get("nodes", {}).items():
+                self._map_nodes[cs] = nd
+            if self._map_nodes:
+                self._node_list_update()
+                # Schedule marker placement after UI is ready
+                self.after(500, self._map_refresh_all_markers)
+                log.info("Loaded %d discoveries from %s",
+                         len(self._map_nodes), _DISCOVERIES_FILE)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.debug("discoveries load failed: %s", exc)
+
+    # ── Dialog helpers ────────────────────────────────────────────────────────
+
+    def _open_api_keys_dialog(self):
+        _APIKeysDialog(self, self._vars)
+
+    def _open_add_provider_dialog(self):
+        _AddProviderDialog(self, self._on_custom_provider_saved)
+
+    def _on_custom_provider_saved(self, preset: dict):
+        """Called by _AddProviderDialog when user saves a new provider."""
+        self._custom_providers.append(preset)
+        # Add to both provider menus
+        name = preset["name"]
+        for menu_attr in ("_provider_menu", "_gate_provider_menu"):
+            menu = getattr(self, menu_attr, None)
+            if menu:
+                current = list(menu.cget("values")) if hasattr(menu, "cget") else []
+                if name not in current:
+                    menu.configure(values=current + [name])
+        # Store preset so _apply_llm_preset can resolve it
+        self._PROVIDER_DEFAULTS[name] = (preset["url"], preset["model"],
+                                          "Custom provider")
+
     # ── Console panel ─────────────────────────────────────────────────────────
 
-    def _build_console_panel(self):
+    def _build_right_panel(self):
+        """Right-area panel with Console and Map tabs."""
         right = ctk.CTkFrame(self, fg_color=P.crust, corner_radius=0)
         right.grid(row=1, column=1, sticky="nsew")
-        right.grid_rowconfigure(1, weight=1)
+        right.grid_rowconfigure(0, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
-        hdr = ctk.CTkFrame(right, fg_color=P.mantle, corner_radius=0, height=38)
+        self._right_tabs = ctk.CTkTabview(
+            right,
+            fg_color=P.crust,
+            segmented_button_fg_color=P.mantle,
+            segmented_button_selected_color=P.blue,
+            segmented_button_selected_hover_color=P.sky,
+            segmented_button_unselected_color=P.mantle,
+            segmented_button_unselected_hover_color=P.surface1,
+            text_color=P.text,
+            text_color_disabled=P.overlay0,
+            command=self._on_right_tab_changed,
+        )
+        self._right_tabs.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self._right_tabs.add("Console")
+        self._right_tabs.add("Map")
+
+        self._build_console_tab(self._right_tabs.tab("Console"))
+        self._build_map_tab(self._right_tabs.tab("Map"))
+
+    def _build_console_tab(self, tab):
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        # header bar with Clear button
+        hdr = ctk.CTkFrame(tab, fg_color=P.mantle, corner_radius=0, height=36)
         hdr.grid(row=0, column=0, sticky="ew")
         hdr.grid_propagate(False)
         hdr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(hdr, text="Console",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=P.blue).grid(row=0, column=0, padx=12,
-                                              pady=8, sticky="w")
-        ctk.CTkButton(hdr, text="Clear", width=60, height=24,
-                      fg_color=P.surface1, hover_color=P.surface2,
-                      text_color=P.subtext, corner_radius=6,
-                      font=ctk.CTkFont(size=11),
-                      command=self._clear_console).grid(row=0, column=1,
-                                                         padx=8, pady=6,
-                                                         sticky="e")
+
+        # Restart-required banner (hidden by default)
+        self._restart_bar = ctk.CTkFrame(tab, fg_color=P.yellow,
+                                          corner_radius=0, height=28)
+        self._restart_bar.grid(row=0, column=0, sticky="ew")
+        self._restart_bar.grid_propagate(False)
+        self._restart_bar.grid_remove()
+        ctk.CTkLabel(self._restart_bar,
+                     text="⚠  Settings changed — restart bridge to apply",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=P.base).pack(side="left", padx=10, pady=4)
 
         if sys.platform == "win32":
             mono = ("Cascadia Code", 10)
@@ -621,13 +1320,21 @@ class App(ctk.CTk):
             mono = ("DejaVu Sans Mono", 10)
 
         self._console = ctk.CTkTextbox(
-            right,
+            tab,
             fg_color=P.crust, text_color=P.text,
             font=mono, wrap="word", state="disabled",
             scrollbar_button_color=P.surface1,
             scrollbar_button_hover_color=P.surface2,
         )
         self._console.grid(row=1, column=0, sticky="nsew")
+
+        ctk.CTkButton(hdr, text="Clear", width=60, height=24,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.subtext, corner_radius=6,
+                      font=ctk.CTkFont(size=11),
+                      command=self._clear_console).grid(row=0, column=1,
+                                                         padx=8, pady=6,
+                                                         sticky="e")
 
         tb = self._console._textbox
         tb.tag_configure("TS",       foreground=P.overlay0)
@@ -641,6 +1348,56 @@ class App(ctk.CTk):
         tb.tag_configure("LLM",      foreground=P.mauve)
         tb.tag_configure("BOT",      foreground=P.peach)
         tb.tag_configure("CONN",     foreground=P.teal)
+
+    def _build_map_tab(self, tab):
+        """Map tab placeholder — mapview is created lazily on first open."""
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+        self._map_markers: dict = {}  # callsign -> TkinterMapView marker
+        self._map_tab_frame = tab      # stored for lazy init
+        self._mapview_ready = False
+
+        if not _HAS_MAPVIEW:
+            ctk.CTkLabel(tab,
+                         text="tkintermapview not installed.\nRun: pip install tkintermapview",
+                         text_color=P.overlay1, justify="center").grid(
+                row=0, column=0)
+            return
+
+        # Placeholder shown before first open
+        self._map_placeholder = ctk.CTkLabel(
+            tab, text="Open this tab to load the map",
+            text_color=P.overlay0, font=ctk.CTkFont(size=12))
+        self._map_placeholder.grid(row=0, column=0)
+
+    def _init_mapview_lazy(self):
+        """Create TkinterMapView on first Map tab open (saves network on console-only use)."""
+        if self._mapview_ready or not _HAS_MAPVIEW:
+            return
+        self._mapview_ready = True
+        if hasattr(self, "_map_placeholder"):
+            self._map_placeholder.grid_remove()
+        tab = self._map_tab_frame
+        self._mapview = tkintermapview.TkinterMapView(
+            tab, corner_radius=0, bg_color=P.crust,
+            database_path=_TILE_CACHE_FILE,  # cache tiles locally for faster reloads
+        )
+        self._mapview.grid(row=0, column=0, sticky="nsew")
+        self._mapview.set_position(50.0, 19.0)
+        self._mapview.set_zoom(6)
+        # Place existing nodes after widget settles
+        self.after(300, self._map_refresh_all_markers)
+
+    def _on_right_tab_changed(self):
+        """Called when Console/Map tab switches; lazy-init + refresh markers."""
+        if self._right_tabs.get() == "Map" and _HAS_MAPVIEW:
+            self._init_mapview_lazy()
+            if self._mapview_ready:
+                self.after(150, self._map_refresh_all_markers)
+
+    def _on_tab_changed(self, name: str):
+        """Sidebar tab changed — nothing to toggle in right area anymore."""
+        pass
 
     def _clear_console(self):
         self._console.configure(state="normal")
@@ -752,12 +1509,18 @@ class App(ctk.CTk):
             except Exception:
                 return fallback
 
-        config = DEFAULT_CONFIG.copy()
+        config = load_persisted_config()
 
         config["serial_port"]          = _get("serial_port")  or DEFAULT_CONFIG["serial_port"]
         config["baud_rate"]            = int(_get("baud_rate", DEFAULT_CONFIG["baud_rate"]))
+        config["llm_provider"]         = _get("llm_provider") or DEFAULT_CONFIG["llm_provider"]
         config["lm_url"]               = _get("lm_url")       or DEFAULT_CONFIG["lm_url"]
         config["model"]                = _get("model")        or DEFAULT_CONFIG["model"]
+        config["llm_api_key"]          = _get("llm_api_key") or None
+        config["local_gate_provider"]  = _get("local_gate_provider") or DEFAULT_CONFIG.get("local_gate_provider", "openai_compat")
+        config["local_gate_url"]       = _get("local_gate_url") or DEFAULT_CONFIG.get("local_gate_url", DEFAULT_OPENAI_COMPAT_URL)
+        config["local_gate_model"]     = _get("local_gate_model") or DEFAULT_CONFIG.get("local_gate_model", DEFAULT_CONFIG["model"])
+        config["local_gate_api_key"]   = _get("local_gate_api_key") or None
         ai_prefix_val = _get("ai_prefix", DEFAULT_CONFIG["ai_prefix"])
         bot_prefix_val = _get("bot_prefix", DEFAULT_CONFIG["bot_prefix"])
         config["ai_prefix"]            = ai_prefix_val if ai_prefix_val is not None else DEFAULT_CONFIG["ai_prefix"]
@@ -771,9 +1534,17 @@ class App(ctk.CTk):
             "monitor_reminder_s", DEFAULT_CONFIG["monitor_reminder_s"])))
         config["channel_context_msgs"] = int(float(_get(
             "channel_context_msgs", DEFAULT_CONFIG["channel_context_msgs"])))
+        config["token_budget_total"] = max(0, int(float(_get(
+            "token_budget_total", DEFAULT_CONFIG.get("token_budget_total", 0)))))
+        config["token_budget_prompt"] = max(0, int(float(_get(
+            "token_budget_prompt", DEFAULT_CONFIG.get("token_budget_prompt", 0)))))
+        config["token_budget_completion"] = max(0, int(float(_get(
+            "token_budget_completion", DEFAULT_CONFIG.get("token_budget_completion", 0)))))
         config["news_api_key"]         = _get("news_api_key") or None
 
         listen_raw = (_get("listen_channels") or "").strip()
+        if listen_raw.lower() in {"none", "null", "[]"}:
+            listen_raw = ""
         config["listen_channels"] = (
             [int(x) for x in listen_raw.split() if x.isdigit()]
             if listen_raw else None
@@ -793,6 +1564,8 @@ class App(ctk.CTk):
         config["auto_engage_intensity"] = self._vars.get(
             "auto_engage_intensity", ctk.StringVar(value="off")).get()
         config["auto_engage_worth_reply"] = config["auto_engage_intensity"] != "off"
+        config["local_gate_enabled"] = self._feat_vars.get(
+            "__local_gate__", ctk.BooleanVar(value=False)).get()
         disabled: set[str] = set()
         for key, _ in BOT_FEATURES:
             if not self._feat_vars.get(key, ctk.BooleanVar(value=True)).get():
@@ -802,49 +1575,105 @@ class App(ctk.CTk):
         return config
 
     def _save_settings(self):
-        data: dict = {}
-        for key, var in self._vars.items():
-            try:
-                data[key] = var.get()
-            except Exception:
-                pass
-        for key, var in self._feat_vars.items():
-            try:
-                data[f"feat_{key}"] = bool(var.get())
-            except Exception:
-                pass
+        data = self._collect_config()
         try:
-            with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except OSError as exc:
+            save_user_config(data)
+        except Exception as exc:
             log.debug("Could not save settings: %s", exc)
 
     def _load_settings(self):
-        if not os.path.exists(_CONFIG_FILE):
-            return
         try:
-            with open(_CONFIG_FILE, encoding="utf-8") as f:
-                data = json.load(f)
+            data = load_persisted_config()
         except Exception as exc:
             log.debug("Could not load settings: %s", exc)
             return
+
         for key, var in self._vars.items():
             if key in data:
                 try:
+                    if key == "listen_channels":
+                        val = data[key]
+                        if val in (None, "", "None", "null", []):
+                            var.set("")
+                            continue
+                        if isinstance(val, (list, tuple, set)):
+                            var.set(" ".join(str(x) for x in val))
+                            continue
+                    if key == "reply_channel" and data[key] in (None, "None", "null", ""):
+                        var.set("")
+                        continue
                     var.set(data[key])
                 except Exception:
                     pass
-        for key, var in self._feat_vars.items():
-            saved = f"feat_{key}"
-            if saved in data:
-                try:
-                    var.set(bool(data[saved]))
-                except Exception:
-                    pass
+
+        # Feature toggles stored as real config keys.
+        feat_map = {
+            "__ai__": "ai_enabled",
+            "__reply_unknown__": "reply_unknown_command",
+            "__mention_ai__": "mention_ai_enabled",
+            "__local_gate__": "local_gate_enabled",
+        }
+        for feat_key, cfg_key in feat_map.items():
+            var = self._feat_vars.get(feat_key)
+            if var is None or cfg_key not in data:
+                continue
+            try:
+                var.set(bool(data[cfg_key]))
+            except Exception:
+                pass
+
+        disabled = set(data.get("disabled_commands") or [])
+        for key, _ in BOT_FEATURES:
+            var = self._feat_vars.get(key)
+            if var is None:
+                continue
+            try:
+                var.set(key not in disabled)
+            except Exception:
+                pass
+
+        # Refresh intensity hint after load
+        intensity_var = self._vars.get("auto_engage_intensity")
+        if intensity_var:
+            self._update_intensity_hint(intensity_var.get())
+
+        # Seed per-provider model memory from loaded config
+        prov = data.get("llm_provider") or DEFAULT_CONFIG["llm_provider"]
+        model = data.get("model") or DEFAULT_CONFIG["model"]
+        if prov and model:
+            self._provider_models[prov] = model
+        gate_prov = data.get("local_gate_provider") or DEFAULT_CONFIG.get("local_gate_provider", "openai_compat")
+        gate_model = data.get("local_gate_model") or DEFAULT_CONFIG.get("local_gate_model", DEFAULT_CONFIG["model"])
+        if gate_prov and gate_model:
+            self._gate_models[gate_prov] = gate_model
+
+        self._bind_change_traces()
+
+    def _on_setting_changed(self, *_args):
+        """Show restart banner when settings change while bridge is running."""
+        if (hasattr(self, "_restart_bar")
+                and self._runner and self._runner.is_running):
+            self._restart_bar.grid()
+
+    def _bind_change_traces(self):
+        """Bind write traces to all config vars so we can detect live changes."""
+        for var in self._vars.values():
+            try:
+                var.trace_add("write", self._on_setting_changed)
+            except Exception:
+                pass
+        for var in self._feat_vars.values():
+            try:
+                var.trace_add("write", self._on_setting_changed)
+            except Exception:
+                pass
 
     # ── Status & animation ────────────────────────────────────────────────────
 
     def _set_running(self, running: bool, stopping: bool = False):
+        # Always hide restart bar when bridge state changes
+        if hasattr(self, "_restart_bar"):
+            self._restart_bar.grid_remove()
         if stopping:
             self._start_btn.configure(state="disabled")
             self._stop_btn.configure(state="disabled")
@@ -908,7 +1737,7 @@ class App(ctk.CTk):
         config = self._collect_config()
         log.info("Starting bridge \u2014 %s @ %d baud \u2026",
                  config["serial_port"], config["baud_rate"])
-        self._runner = _BridgeRunner(config)
+        self._runner = _BridgeRunner(config, self._map_queue)
         self._runner.start()
         self._set_running(True)
         self.after(800, self._watch_bridge)
@@ -955,6 +1784,7 @@ class App(ctk.CTk):
             self._runner.stop()
             self._runner = None
         self._save_settings()
+        self._map_nodes_save()
         self.destroy()
 
 
@@ -967,6 +1797,9 @@ def main():
         datefmt="%H:%M:%S",
         handlers=[logging.FileHandler("AIbridge.log", encoding="utf-8")],
     )
+    # Suppress noisy third-party tile/image loggers
+    for _noisy in ("tkintermapview", "PIL", "urllib3", "requests"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     app = App()
     app.protocol("WM_DELETE_WINDOW", app.on_close)
     app.mainloop()

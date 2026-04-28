@@ -7,6 +7,56 @@ import re
 from meshcore_bridge.config import BYTE_LIMIT
 
 
+# ── Language detection ───────────────────────────────────────────────────────
+# Lightweight heuristic — no external deps. Detects by unique script/char sets.
+_LANG_PROFILES: list[tuple[str, set[str]]] = [
+    ("Polish",     set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ")),
+    ("German",     set("äöüßÄÖÜ")),
+    ("French",     set("àâæçèéêëîïôœùûüÿÀÂÆÇÈÉÊËÎÏÔŒÙÛÜŸ")),
+    ("Spanish",    set("áéíóúüñÁÉÍÓÚÜÑ¿¡")),
+    ("Portuguese", set("ãõáéíóúâêôàçÃÕÁÉÍÓÚÂÊÔÀÇ")),
+    ("Italian",    set("àèéìîóùÀÈÉÌÎÓÙ")),
+    ("Russian",    set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")),
+]
+
+_POLISH_HINTS = {
+    "tak", "nie", "po", "polsku", "fajny", "gosc", "gość", "krotki", "krótki",
+    "wiersz", "botach", "potrzebuje", "potrzebuję", "napisal", "napisał",
+    "ilu", "masz", "kolegow", "kolegów", "ogarniesz", "asystent", "czemu",
+    "jestes", "jesteś", "tutaj", "halo", "odbior", "odbiór", "dziala", "działa",
+}
+
+
+def detect_language(text: str) -> str | None:
+    """Return best-guess language name, or None if confidence is weak."""
+    if not text:
+        return None
+    scores: dict[str, int] = {}
+    for lang, chars in _LANG_PROFILES:
+        score = sum(1 for c in text if c in chars)
+        if score:
+            scores[lang] = score
+    lowered = text.lower()
+    tokens = set(re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]+", lowered))
+    polish_hits = len(tokens & _POLISH_HINTS)
+    if polish_hits >= 2:
+        scores["Polish"] = scores.get("Polish", 0) + polish_hits
+    if not scores:
+        return None
+    return max(scores, key=lambda k: scores[k])
+
+
+def sanitize_mesh_reply(text: str) -> str:
+    """Remove formatting/noise that should never be sent over mesh."""
+    if not text:
+        return ""
+    cleaned = text.strip()
+    cleaned = re.sub(r"\(Note:\s*\d+\s*char\s*limit\s*exceeded[^)]*\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("`", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def get_payload_value(payload: dict, *keys, default="?"):
     """
     Fetches a value from the payload trying different key variants.

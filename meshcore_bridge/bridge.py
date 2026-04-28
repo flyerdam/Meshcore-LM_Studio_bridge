@@ -4,6 +4,7 @@ Main bridge: ties MeshCore events to the LLM, bot commands, and web services.
 
 import asyncio
 import logging
+import queue as _queue
 import re
 import time
 
@@ -19,16 +20,111 @@ from meshcore_bridge.web_search import WebSearch
 log = logging.getLogger(__name__)
 
 
+def _build_commands_appendix(cfg: dict) -> str:
+    """Return a live-config commands block to append to the system prompt."""
+    ai_pfx  = str(cfg.get("ai_prefix",  "!ai")  or "").strip()
+    bot_pfx = str(cfg.get("bot_prefix", "!bot") or "").strip()
+    disabled = set(cfg.get("disabled_commands") or [])
+
+    _DESC = {
+        "ping":     "<no args> – connection test, returns SNR/hops",
+        "test":     "<no args> – full connection parameters",
+        "info":     "<no args> – node info: firmware, model, uptime, battery",
+        "status":   "<no args> – alias for info",
+        "stats":    "<no args> – packet statistics rx/tx/flood/direct",
+        "path":     "<no args> – routing path and quality",
+        "snr":      "<no args> – signal quality analysis",
+        "weather":  "<city> – current weather",
+        "news":     "[topic] – latest headlines",
+        "search":   "<query> – web search",
+        "channel":  "<no args> – SNR analysis of all stations on this channel",
+        "channels": "<no args> – list all mesh channels",
+        "reset":    "<no args> – reset routing paths",
+        "monitor":  "on|off – automatic SNR warning alerts",
+        "help":     "<no args> – list all bot commands",
+    }
+
+    # Canonical order (same as BotCommands.CMDS, deduped)
+    _ORDER = ["ping", "test", "info", "status", "stats", "path", "snr",
+              "weather", "news", "search", "channel", "channels", "reset",
+              "monitor", "help"]
+
+    lines = ["\n\n[ACTIVE COMMANDS — authoritative, use ONLY these exact prefixes and names]"]
+
+    if ai_pfx:
+        lines.append(
+            f"AI query prefix: '{ai_pfx}'\n"
+            f"  {ai_pfx} <question>  – ask AI anything\n"
+            f"  {ai_pfx} reset       – clear conversation history\n"
+            f"  {ai_pfx} help        – show AI usage hint"
+        )
+    else:
+        lines.append("AI: triggered by @mention or AI keywords (no prefix set)")
+
+    active = [cmd for cmd in _ORDER if cmd not in disabled]
+    if bot_pfx:
+        if active:
+            lines.append(f"Bot prefix: '{bot_pfx}'")
+            for cmd in active:
+                desc = _DESC.get(cmd, "")
+                lines.append(f"  {bot_pfx} {cmd} {desc}")
+        else:
+            lines.append(f"Bot prefix: '{bot_pfx}' – all commands currently disabled")
+    else:
+        if active:
+            lines.append("Bot commands: no prefix — type command name directly")
+            for cmd in active:
+                desc = _DESC.get(cmd, "")
+                lines.append(f"  {cmd} {desc}")
+        else:
+            lines.append("Bot commands: all disabled")
+
+    if disabled:
+        lines.append(f"Disabled (do not mention): {', '.join(sorted(disabled))}")
+
+    lines.append(
+        "IMPORTANT: only mention commands from the list above. "
+        "Do NOT invent or suggest commands that are not listed here."
+    )
+    return "\n".join(lines)
+
+
 class MeshCoreLLMBridge:
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, map_queue: _queue.Queue | None = None):
         self.cfg       = config
+        self._map_queue = map_queue
+        _system_prompt = config["system_prompt"] + _build_commands_appendix(config)
         self.llm       = LMStudioClient(
             url           = config["lm_url"],
             model         = config["model"],
-            system_prompt = config["system_prompt"],
+            system_prompt = _system_prompt,
             history_len   = config["history_len"],
+            provider      = config.get("llm_provider", "openai_compat"),
+            api_key       = config.get("llm_api_key"),
+            github_api_version = config.get("github_api_version", "2026-03-10"),
+            model_caps_cache_file = config.get("model_caps_cache_file", "model_capabilities_cache.json"),
+            model_caps_cache_ttl_s = config.get("model_caps_cache_ttl_s", 86400),
+            token_budget_total = config.get("token_budget_total", 0),
+            token_budget_prompt = config.get("token_budget_prompt", 0),
+            token_budget_completion = config.get("token_budget_completion", 0),
         )
+        self.gate_llm: LMStudioClient | None = None
+        if config.get("local_gate_enabled", False):
+            self.gate_llm = LMStudioClient(
+                url=config.get("local_gate_url", config.get("lm_url")),
+                model=config.get("local_gate_model", config.get("model")),
+                system_prompt=_system_prompt,
+                history_len=1,
+                provider=config.get("local_gate_provider", "openai_compat"),
+                api_key=config.get("local_gate_api_key"),
+                github_api_version=config.get("github_api_version", "2026-03-10"),
+                model_caps_cache_file=config.get("model_caps_cache_file", "model_capabilities_cache.json"),
+                model_caps_cache_ttl_s=config.get("model_caps_cache_ttl_s", 86400),
+                token_budget_total=0,
+                token_budget_prompt=0,
+                token_budget_completion=0,
+            )
         self.web       = WebSearch(config)
         self.serial    = SerialConnection(
             port=config["serial_port"],
@@ -104,6 +200,90 @@ class MeshCoreLLMBridge:
         self.bot = BotCommands(device_info, self.cfg, self.llm, self.web,
                                self._telemetry, mc)
 
+        # Pre-populate contacts cache so ADVERTISEMENT lookups can resolve names
+        try:
+            await mc.ensure_contacts()
+            log.info("Contacts loaded: %d entries", len(mc._contacts or {}))
+        except Exception as e:
+            log.warning("ensure_contacts failed: %s", e)
+
+        # Subscribe to advertisement events – these are NOT delivered by get_msg()
+        try:
+            mc.subscribe(EventType.ADVERTISEMENT, self._on_advert_event)
+            mc.subscribe(EventType.NEW_CONTACT,   self._on_advert_event)
+            log.info("Subscribed to ADVERTISEMENT + NEW_CONTACT events")
+        except Exception as e:
+            log.warning("Could not subscribe to advert events: %s", e)
+
+    async def _on_advert_event(self, event):
+        """Async callback for ADVERTISEMENT / NEW_CONTACT events from mc.subscribe()."""
+        payload = event.payload or {}
+        _name = (payload.get("adv_name") or payload.get("name")
+                 or payload.get("callsign"))
+
+        # ADVERTISEMENT payloads only carry public_key — look up name from contacts
+        if not _name:
+            pub_key = payload.get("public_key", "")
+            if pub_key:
+                mc = self.serial.mc
+                if mc is not None:
+                    try:
+                        contact = mc.get_contact_by_key_prefix(pub_key[:16])
+                        if contact:
+                            _name = (contact.get("adv_name") or contact.get("name")
+                                     or contact.get("callsign"))
+                            # Merge contact fields into payload for GPS etc.
+                            payload = {**contact, **payload}
+                        else:
+                            log.debug("ADVERT: key %s not in contacts cache", pub_key[:16])
+                    except Exception as exc:
+                        log.debug("ADVERT contact lookup error: %s", exc)
+
+        _snr  = payload.get("snr") or payload.get("SNR") or ""
+        log.info("ADVERT EVENT type=%s name=%s snr=%s payload=%s",
+                 event.type, _name or "?", _snr, payload)
+        if not _name or _name in ("?", "UNKNOWN"):
+            return
+
+        # GPS: NEW_CONTACT uses adv_lat/adv_lon; raw adverts use lat/lon
+        try:
+            lat = float(payload.get("adv_lat") or payload.get("lat")
+                        or payload.get("latitude") or 0)
+        except (TypeError, ValueError):
+            lat = 0.0
+        try:
+            lon = float(payload.get("adv_lon") or payload.get("lon")
+                        or payload.get("longitude") or 0)
+        except (TypeError, ValueError):
+            lon = 0.0
+        try:
+            lat_i = payload.get("lat_i")
+            if lat_i and abs(lat) < 0.001:
+                lat = int(lat_i) / 1e7
+            lon_i = payload.get("lon_i")
+            if lon_i and abs(lon) < 0.001:
+                lon = int(lon_i) / 1e7
+        except (TypeError, ValueError):
+            pass
+        has_gps = (abs(lat) > 0.001 or abs(lon) > 0.001)
+        # node_type: 0=companion, 1=??, 2=repeater (from MeshCore contact type field)
+        node_type = payload.get("type", 0)
+        item = {
+            "kind":      "advert",
+            "callsign":  _name,
+            "snr":       _snr,
+            "last_seen": time.time(),
+            "node_type": node_type,
+        }
+        if has_gps:
+            item["lat"] = lat
+            item["lon"] = lon
+        if self._map_queue is not None:
+            try:
+                self._map_queue.put_nowait(item)
+            except Exception:
+                pass
+
     # ── Telemetry ───────────────────────────────────────────────────────────
     async def _refresh_telemetry(self):
         """Polls the node for additional telemetry (get_bat, get_node_info)."""
@@ -177,6 +357,61 @@ class MeshCoreLLMBridge:
     # ── Deduplication and Queuing ───────────────────────────────────────────
     def _on_event(self, event):
         payload  = event.payload or {}
+
+        # ── Heard-nodes tracking: extract sender/GPS from ANY event ──────────
+        # Try explicit payload keys first; fall back to parsing "sender: text"
+        _name = get_payload_value(payload, "adv_name", "name", "pubkey_prefix",
+                                  default=None)
+        if not _name or _name in ("?", "UNKNOWN"):
+            _text = payload.get("text", "")
+            if _text and ": " in _text:
+                _name = _text.split(": ", 1)[0].strip() or None
+
+        if _name and _name not in ("?", "UNKNOWN"):
+            try:
+                lat = float(payload.get("lat") or payload.get("latitude") or 0)
+            except (TypeError, ValueError):
+                lat = 0.0
+            try:
+                lon = float(payload.get("lon") or payload.get("longitude") or 0)
+            except (TypeError, ValueError):
+                lon = 0.0
+            try:
+                lat_i = payload.get("lat_i")
+                if lat_i and abs(lat) < 0.001:
+                    lat = int(lat_i) / 1e7
+                lon_i = payload.get("lon_i")
+                if lon_i and abs(lon) < 0.001:
+                    lon = int(lon_i) / 1e7
+            except (TypeError, ValueError):
+                pass
+            snr = payload.get("snr") or payload.get("SNR") or ""
+            has_gps = (abs(lat) > 0.001 or abs(lon) > 0.001)
+            item = {
+                "kind":      "advert" if has_gps else "contact",
+                "callsign":  _name,
+                "snr":       snr,
+                "last_seen": time.time(),
+            }
+            if has_gps:
+                item["lat"] = lat
+                item["lon"] = lon
+            log.info("NODE TRACK %s gps=%s snr=%s event=%s", _name, has_gps, snr, event.type)
+            if self._map_queue is not None:
+                try:
+                    self._map_queue.put_nowait(item)
+                except _queue.Full:
+                    pass
+
+        # Log advert events explicitly for debugging
+        if event.type == EventType.ADVERTISEMENT:
+            _adv_name = (payload.get("adv_name") or payload.get("name") or payload.get("callsign") or "?")
+            _adv_snr  = payload.get("snr") or payload.get("SNR") or ""
+            log.info("ADVERT HEARD name=%s snr=%s payload=%s", _adv_name, _adv_snr, payload)
+        elif event.type == EventType.NEW_CONTACT:
+            _nc_name = (payload.get("adv_name") or payload.get("name") or payload.get("callsign") or "?")
+            log.info("NEW CONTACT name=%s payload=%s", _nc_name, payload)
+
         txt_hash = payload.get("txt_hash")
         msg_key  = (
             txt_hash
@@ -263,8 +498,13 @@ class MeshCoreLLMBridge:
                 return body[match.end():].lstrip(" \t,:;-")
         return None
 
-    def _collect_channel_context(self, channel: int | None) -> list[dict] | None:
-        """Return filtered recent channel context for LLM requests."""
+    def _collect_channel_context(self, channel: int | None,
+                                   exclude_text: str | None = None) -> list[dict] | None:
+        """Return filtered recent channel context for LLM requests.
+        
+        exclude_text: skip entries whose 'text' field matches this value
+        (prevents the triggering message from appearing twice).
+        """
         ctx_count = self.cfg.get("channel_context_msgs", 5)
         if ctx_count <= 0 or channel is None or not self.bot:
             return None
@@ -275,6 +515,7 @@ class MeshCoreLLMBridge:
 
         bot_pfx = str(self.cfg.get("bot_prefix", "!bot") or "").lower()
         ai_pfx = str(self.cfg.get("ai_prefix", "!ai") or "").lower()
+        exclude_norm = exclude_text.strip() if exclude_text else None
 
         context_entries = []
         for m in list(hist):
@@ -285,6 +526,13 @@ class MeshCoreLLMBridge:
                 (not bot_pfx) and self.bot.match(txt)[0] is not None
             )
             is_ai = bool(ai_pfx) and ai_pfx in low
+
+            # Skip the triggering message itself to avoid duplication.
+            if exclude_norm and txt.strip() == exclude_norm:
+                continue
+            # Also match "sender: body" format stored in history.
+            if exclude_norm and txt.strip().endswith(f": {exclude_norm}"):
+                continue
 
             if not is_bot and not is_ai:
                 context_entries.append(m)
@@ -312,17 +560,29 @@ class MeshCoreLLMBridge:
         if sender_norm and sender_norm in self._mention_aliases():
             return False
 
-        # If message mentions someone else and not this bot, keep silent.
+        # Foreign mentions alone should not trigger AI, but mixed-recipient
+        # messages like "@[john] ask flyer ai..." should still be allowed.
         aliases = self._mention_aliases()
+        body_norm = "".join(ch for ch in body.lower() if ch.isalnum())
+        addresses_ai = any(alias and alias in body_norm for alias in aliases) or bool(
+            re.search(r"\b(ai|bocie|asystencie|assistant|asystent|robot|bot)\b", body, re.IGNORECASE)
+        )
+        foreign_mention_found = False
         for match in re.finditer(r"@\[(?P<bracket>[^\]]+)\]|@(?P<plain>[^\s]+)", body):
             raw_name = (match.group("bracket") or match.group("plain") or "").strip()
             cand_norm = self._normalize_mention_name(raw_name)
             if cand_norm and cand_norm not in aliases:
-                return False
+                foreign_mention_found = True
+                break
+        if foreign_mention_found and not addresses_ai:
+            return False
 
         channel_context = self._collect_channel_context(channel)
+        gate_client = self.gate_llm or self.llm
+        gate_label = f"{gate_client.provider}:{gate_client.model}"
+        log.info("AUTO-GATE using [%s] for '%s'", gate_label, body[:60])
         return await asyncio.get_event_loop().run_in_executor(
-            None, self.llm.should_reply, sender, body, channel_context,
+            None, gate_client.should_reply, sender, body, channel_context,
             sorted(aliases), intensity
         )
 
@@ -338,6 +598,8 @@ class MeshCoreLLMBridge:
                 sender, text, channel, payload = parsed
 
                 listen = self.cfg.get("listen_channels")
+                if isinstance(listen, list) and len(listen) == 0:
+                    listen = None
                 if channel is not None and listen is not None and channel not in listen:
                     continue
 
@@ -492,19 +754,31 @@ class MeshCoreLLMBridge:
                 await self._send(f"{mention}type your question after trigger.", reply_ch, orig_event)
                 return
 
-            # Collect channel context
-            channel_context = self._collect_channel_context(channel)
+            # Collect channel context — exclude the current question to avoid duplication
+            channel_context = self._collect_channel_context(channel, exclude_text=question)
+
+            # Inject real signal stats from the triggering event so the LLM
+            # knows the actual values and does not hallucinate them.
+            _ep = (orig_event.payload or {}) if orig_event else {}
+            _snr = _ep.get("SNR")
+            _hops = _ep.get("path_len")
+            if _snr is not None or _hops is not None:
+                _hops_str = "direct" if _hops == 0 else str(_hops)
+                _signal_note = f"[Signal for this message: SNR={_snr}dB, hops={_hops_str}. Use these exact values if asked.]"
+                channel_context = [{"sender": "signal_info", "text": _signal_note}] + (channel_context or [])
+
             if channel_context:
                 log.debug("Channel context: %d messages", len(channel_context))
 
-            log.info("LM Studio << %s (context: %s msg)",
-                     question, len(channel_context) if channel_context else 0)
+            provider_label = f"{self.llm.provider}:{self.llm.model}"
+            log.info("LLM >> [%s] %s (context: %s msg)",
+                     provider_label, question, len(channel_context) if channel_context else 0)
             answer = await asyncio.get_event_loop().run_in_executor(
                 None, self.llm.ask, sender, question, channel_context, save_history
             )
-            log.info("LM Studio >> %s", answer[:120])
+            log.info("LLM << [%s] %s", provider_label, answer[:120])
             if not answer.strip():
-                log.info("LM Studio returned empty – staying silent")
+                log.info("LLM returned empty – staying silent")
                 return
             await asyncio.sleep(float(self.cfg.get("reply_delay_s", 0)))
             await self._send_chunked(mention, answer, reply_ch, orig_event)
@@ -611,6 +885,11 @@ class MeshCoreLLMBridge:
                 if event is not None and event.type not in (
                     EventType.NO_MORE_MSGS, EventType.ERROR
                 ):
+                    if event.type not in (
+                        EventType.CHANNEL_MSG_RECV, EventType.CONTACT_MSG_RECV,
+                        EventType.BATTERY, EventType.MESSAGES_WAITING,
+                    ):
+                        log.info("RAW EVT type=%s payload=%s", event.type, event.payload)
                     self._on_event(event)
             except asyncio.CancelledError:
                 break
@@ -671,8 +950,13 @@ class MeshCoreLLMBridge:
         # LLM
         log.info("╠" + "═" * W + "╣")
         log.info("║  %-*s║", W - 1, "── AI Model ────────────────────────────────")
+        log.info("║%s║", row("Provider:", c.get("llm_provider", "openai_compat")))
         log.info("║%s║", row("Model:", c["model"]))
         log.info("║%s║", row("URL:", c["lm_url"]))
+        if self.gate_llm:
+            log.info("║%s║", row("Auto-gate LLM:", f"local {c.get('local_gate_provider')} {c.get('local_gate_model')}"))
+        else:
+            log.info("║%s║", row("Auto-gate LLM:", "same as main provider"))
         log.info("║%s║", row("Conversation history:", f"{c['history_len']} messages per caller"))
         log.info("║%s║", row("Channel context:", f"{c.get('channel_context_msgs',5)} recent msg"))
 
