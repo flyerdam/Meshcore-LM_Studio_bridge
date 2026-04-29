@@ -1339,6 +1339,18 @@ class App(ctk.CTk):
                       text_color=P.text, corner_radius=6,
                       command=self._map_clear).pack(side="right", padx=4)
 
+        # Search bar
+        self._node_search_var = ctk.StringVar()
+        self._node_search_after: str | None = None
+        self._node_search_var.trace_add("write", self._node_search_changed)
+        search_entry = ctk.CTkEntry(
+            tab, textvariable=self._node_search_var,
+            placeholder_text="🔍  Search nodes…",
+            fg_color=P.surface0, text_color=P.text,
+            border_width=0, height=28, corner_radius=6,
+        )
+        search_entry.pack(fill="x", padx=8, pady=(0, 4))
+
         self._node_list_frame = ctk.CTkScrollableFrame(
             tab, fg_color=P.base, corner_radius=8)
         self._node_list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1447,6 +1459,18 @@ class App(ctk.CTk):
                         self._map_place_marker(cs, nd)
         self.after(2000, self._poll_map_queue)
 
+    def _node_search_changed(self, *_):
+        """Debounce: rebuild list 150 ms after last keystroke."""
+        after_id = getattr(self, "_node_search_after", None)
+        if after_id:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+        self._node_search_after = self.after(150, self._node_list_update)
+
+    _NODE_LIST_CAP = 100  # max rows shown when not searching
+
     def _node_list_update(self):
         """Rebuild the sidebar node list sorted by last_seen descending."""
         if not hasattr(self, "_node_list_frame"):
@@ -1455,13 +1479,28 @@ class App(ctk.CTk):
         for w in frame.winfo_children():
             w.destroy()
         now = time.time()
+        query = getattr(self, "_node_search_var", None)
+        query = query.get().strip().lower() if query else ""
         sorted_nodes = sorted(
             self._map_nodes.items(),
             key=lambda kv: kv[1].get("last_seen", 0),
             reverse=True,
         )
+        total = len(sorted_nodes)
+        # Apply search filter (case-insensitive, matches callsign or name)
+        if query:
+            sorted_nodes = [
+                (cs, nd) for cs, nd in sorted_nodes
+                if query in cs.lower() or query in (nd.get("name") or "").lower()
+            ]
+            overflow = 0
+        else:
+            # Cap unfiltered view so widget creation stays fast
+            overflow = max(0, total - self._NODE_LIST_CAP)
+            if overflow:
+                sorted_nodes = sorted_nodes[:self._NODE_LIST_CAP]
         self._map_count_label.configure(
-            text=f"{len(sorted_nodes)} node{'s' if len(sorted_nodes) != 1 else ''}"
+            text=f"{total} node{'s' if total != 1 else ''}"
         )
         for cs, nd in sorted_nodes:
             # Color row by node type: 2=repeater (teal), 1=companion (mauve+bold), else default
@@ -1523,12 +1562,57 @@ class App(ctk.CTk):
             lbl_age = ctk.CTkLabel(row, text=age_str,
                          font=ctk.CTkFont(size=10),
                          text_color=P.overlay0, anchor="e")
-            lbl_age.grid(row=0, column=1, padx=(4, 8), pady=4, sticky="e", rowspan=2)
+            lbl_age.grid(row=0, column=1, padx=(4, 4), pady=4, sticky="e")
+            # 3-dot menu button
+            menu_btn = ctk.CTkButton(
+                row, text="⋯", width=24, height=24,
+                fg_color="transparent", hover_color=P.surface2,
+                text_color=P.overlay0, font=ctk.CTkFont(size=16),
+                corner_radius=4,
+                command=lambda c=_cs, b=None: self._node_context_menu(c),
+            )
+            menu_btn.grid(row=0, column=2, padx=(0, 6), pady=4, sticky="e", rowspan=2)
             # Bind all child widgets so click + hover anywhere on row works
             for widget in (lbl_name, lbl_pos, lbl_age):
                 widget.bind("<Button-1>", _bind)
                 widget.bind("<Enter>", _enter)
                 widget.bind("<Leave>", _leave)
+
+        if overflow:
+            ctk.CTkLabel(
+                frame,
+                text=f"… {overflow} older node{'s' if overflow != 1 else ''}  (type to search all)",
+                font=ctk.CTkFont(size=10),
+                text_color=P.overlay0,
+            ).pack(pady=(4, 2))
+
+    def _node_context_menu(self, callsign: str):
+        """Show a tiny popup menu for a node row."""
+        menu = tk.Menu(self, tearoff=0,
+                       bg=P.surface1, fg=P.text,
+                       activebackground=P.red, activeforeground=P.base,
+                       font=("Segoe UI", 10), bd=0, relief="flat")
+        menu.add_command(
+            label=f"  🗑  Remove {callsign}",
+            command=lambda: self._node_remove(callsign),
+        )
+        try:
+            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _node_remove(self, callsign: str):
+        """Remove a single node from the list, map marker, and persisted file."""
+        self._map_nodes.pop(callsign, None)
+        if _HAS_MAPVIEW and hasattr(self, "_map_markers"):
+            marker = self._map_markers.pop(callsign, None)
+            if marker:
+                try:
+                    marker.delete()
+                except Exception:
+                    pass
+        self._node_list_update()
+        self._map_nodes_save()
 
     def _map_zoom_to(self, callsign: str):
         """Switch to Map tab and zoom to the node's position."""

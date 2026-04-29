@@ -122,7 +122,11 @@ def fit_to_bytes(text: str, limit: int = BYTE_LIMIT) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= limit:
         return text
-    return encoded[:limit].decode("utf-8", errors="ignore").rstrip() + "…"
+    # Reserve 3 bytes for the UTF-8 ellipsis (U+2026 = \xe2\x80\xa6)
+    ellipsis_bytes = "\u2026".encode("utf-8")  # always 3 bytes
+    budget = max(0, limit - len(ellipsis_bytes))
+    truncated = encoded[:budget].decode("utf-8", errors="ignore").rstrip()
+    return truncated + "\u2026"
 
 
 def uptime_str(seconds: int) -> str:
