@@ -173,6 +173,7 @@ class _BridgeRunner(threading.Thread):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
         self._stopped = threading.Event()
+        self._bridge: "MeshCoreLLMBridge | None" = None
 
     # ── Thread body ───────────────────────────────────────────────────────────
 
@@ -206,6 +207,7 @@ class _BridgeRunner(threading.Thread):
 
     async def _async_main(self):
         bridge = MeshCoreLLMBridge(self.config, map_queue=self._map_queue)
+        self._bridge = bridge
         try:
             await bridge.run()
         except asyncio.CancelledError:
@@ -227,6 +229,13 @@ class _BridgeRunner(threading.Thread):
         if self._loop and not self._loop.is_closed() and self._task:
             self._loop.call_soon_threadsafe(self._task.cancel)
         self._stopped.wait(timeout=_STOP_TIMEOUT)
+
+    def submit(self, coro) -> "concurrent.futures.Future | None":
+        """Schedule a coroutine on the bridge asyncio loop; returns a Future."""
+        import concurrent.futures
+        if self._loop is None or self._loop.is_closed():
+            return None
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     @property
     def is_running(self) -> bool:
@@ -282,7 +291,7 @@ class _APIKeysDialog(ctk.CTkToplevel):
     def __init__(self, parent, provider_vars: dict[str, ctk.StringVar]):
         super().__init__(parent)
         self.title("API Keys")
-        self.geometry("480x320")
+        self.geometry("480x430")
         self.resizable(False, False)
         self.grab_set()  # modal
         self.focus_force()
@@ -294,7 +303,7 @@ class _APIKeysDialog(ctk.CTkToplevel):
         ctk.CTkLabel(self, text="Provider API Keys",
                      font=ctk.CTkFont(size=14, weight="bold"),
                      text_color=P.text).pack(pady=(16, 4), padx=20, anchor="w")
-        ctk.CTkLabel(self, text="Keys stored in bridge_config.user.json (local, never synced)",
+        ctk.CTkLabel(self, text="Stored in bridge_config.user.json (gitignored). Prefer env vars — never written to disk.",
                      font=ctk.CTkFont(size=10), text_color=P.overlay0).pack(padx=20, anchor="w")
 
         frame = ctk.CTkFrame(self, fg_color=P.base, corner_radius=8)
@@ -302,8 +311,9 @@ class _APIKeysDialog(ctk.CTkToplevel):
         frame.grid_columnconfigure(1, weight=1)
 
         labels = {
-            "llm_api_key":      ("Main LLM",   "GITHUB_TOKEN / LLM_API_KEY / OPENAI_API_KEY (env fallback)"),
+            "llm_api_key":      ("Main LLM",   "env: GITHUB_TOKEN / LLM_API_KEY / OPENAI_API_KEY"),
             "local_gate_api_key": ("Gate LLM", "Leave blank for local servers (LM Studio, Ollama)"),
+            "news_api_key":     ("NewsAPI",    "newsapi.org key — env: NEWS_API_KEY"),
         }
         for row_idx, (key, (label, hint)) in enumerate(labels.items()):
             ctk.CTkLabel(frame, text=label, text_color=P.subtext,
@@ -325,6 +335,333 @@ class _APIKeysDialog(ctk.CTkToplevel):
         ctk.CTkButton(self, text="Close", width=100, height=32,
                       fg_color=P.blue, hover_color=P.sky, text_color=P.base,
                       command=self.destroy).pack(pady=(0, 14))
+
+
+# ── Channels manager popup ────────────────────────────────────────────────────
+
+class _ChannelsDialog(ctk.CTkToplevel):
+    """
+    Modal dialog that reads channels from the connected device, lets the user
+    choose which ones the bridge should listen to, and can write new / updated
+    channel slots back to the hardware.
+    """
+
+    _MAX_SLOTS = 8  # safe default; overridden by max_channels from device_info
+
+    def __init__(self, parent, runner: "_BridgeRunner | None",
+                 listen_channels_var: ctk.StringVar):
+        super().__init__(parent)
+        self.title("Channel Manager")
+        self.geometry("540x700")
+        self.resizable(True, True)
+        self.grab_set()
+        self.focus_force()
+        self.configure(fg_color=P.mantle)
+
+        self._runner = runner
+        self._listen_var = listen_channels_var
+        self._channel_check_vars: list[ctk.BooleanVar] = []
+        self._channel_rows: list[dict] = []  # {idx, name, hash}
+
+        self._build()
+        self._populate_listen_filter()
+
+    # ── UI build ──────────────────────────────────────────────────────────────
+
+    def _build(self):
+        # Title
+        ctk.CTkLabel(self, text="📡  Channel Manager",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=P.text).pack(pady=(14, 2), padx=20, anchor="w")
+        ctk.CTkLabel(self,
+                     text="Fetch channels from device  →  tick which to listen  →  Apply Filter",
+                     font=ctk.CTkFont(size=10), text_color=P.overlay0).pack(padx=20, anchor="w")
+
+        # ── Fetch button ──
+        fetch_frame = ctk.CTkFrame(self, fg_color="transparent")
+        fetch_frame.pack(fill="x", padx=16, pady=(8, 4))
+        self._fetch_btn = ctk.CTkButton(
+            fetch_frame, text="🔄  Fetch from device", width=180, height=30,
+            fg_color=P.blue, hover_color=P.sky, text_color=P.base,
+            command=self._on_fetch,
+            state="normal" if (self._runner and self._runner.is_running) else "disabled",
+        )
+        self._fetch_btn.pack(side="left")
+        self._fetch_status = ctk.CTkLabel(fetch_frame, text="" if (self._runner and self._runner.is_running)
+                                           else "  Bridge not running — fetch unavailable",
+                                          text_color=P.overlay0, font=ctk.CTkFont(size=10))
+        self._fetch_status.pack(side="left", padx=8)
+
+        # ── Channel list ──
+        ctk.CTkLabel(self, text="Channels  (✓ = bridge will listen on this channel)",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=P.subtext).pack(padx=16, pady=(8, 2), anchor="w")
+
+        list_outer = ctk.CTkFrame(self, fg_color=P.base, corner_radius=8, height=220)
+        list_outer.pack(fill="x", expand=False, padx=16, pady=(0, 4))
+        list_outer.pack_propagate(False)
+
+        self._list_frame = ctk.CTkScrollableFrame(list_outer, fg_color="transparent")
+        self._list_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        self._list_frame.grid_columnconfigure(2, weight=1)
+
+        # Seed with placeholder rows 0..7 until fetched
+        self._render_placeholder_rows()
+
+        # ── Apply filter button ──
+        ctk.CTkButton(self, text="✅  Apply Filter", width=160, height=30,
+                      fg_color=P.green, hover_color=P.teal, text_color=P.base,
+                      command=self._apply_filter).pack(pady=(2, 4))
+
+        # ── Set / Add channel section ──
+        sep = ctk.CTkFrame(self, fg_color=P.surface0, height=1)
+        sep.pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkLabel(self, text="Set / Add Channel on Device",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=P.subtext).pack(padx=16, pady=(4, 2), anchor="w")
+
+        edit_frame = ctk.CTkFrame(self, fg_color=P.base, corner_radius=8)
+        edit_frame.pack(fill="x", padx=16, pady=(0, 4))
+        edit_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(edit_frame, text="Slot #", text_color=P.subtext,
+                     font=ctk.CTkFont(size=11), width=80, anchor="w"
+                     ).grid(row=0, column=0, padx=10, pady=6, sticky="w")
+        self._slot_var = ctk.StringVar(value="0")
+        ctk.CTkEntry(edit_frame, textvariable=self._slot_var, width=60,
+                     fg_color=P.surface0, text_color=P.text, border_width=0
+                     ).grid(row=0, column=1, padx=(4, 10), pady=6, sticky="w")
+
+        ctk.CTkLabel(edit_frame, text="Name", text_color=P.subtext,
+                     font=ctk.CTkFont(size=11), width=80, anchor="w"
+                     ).grid(row=1, column=0, padx=10, pady=6, sticky="w")
+        self._name_var = ctk.StringVar()
+        ctk.CTkEntry(edit_frame, textvariable=self._name_var,
+                     placeholder_text="#ChannelName  or  MyChannel",
+                     fg_color=P.surface0, text_color=P.text, border_width=0
+                     ).grid(row=1, column=1, padx=(4, 10), pady=6, sticky="ew")
+
+        ctk.CTkLabel(edit_frame, text="Secret key\n(hex, optional)", text_color=P.subtext,
+                     font=ctk.CTkFont(size=10), width=80, anchor="w"
+                     ).grid(row=2, column=0, padx=10, pady=6, sticky="w")
+        self._secret_var = ctk.StringVar()
+        ctk.CTkEntry(edit_frame, textvariable=self._secret_var,
+                     placeholder_text="32 hex chars — leave blank to derive from name",
+                     fg_color=P.surface0, text_color=P.text, border_width=0
+                     ).grid(row=2, column=1, padx=(4, 10), pady=6, sticky="ew")
+
+        ctk.CTkLabel(edit_frame, text="  # prefix = key derived from name  |  private = provide 32 hex chars",
+                     text_color=P.overlay0, font=ctk.CTkFont(size=9),
+                     ).grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 4), sticky="w")
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(2, 10))
+        self._save_btn = ctk.CTkButton(
+            btn_row, text="💾  Save to Device", width=160, height=30,
+            fg_color=P.mauve, hover_color=P.peach, text_color=P.base,
+            command=self._on_save_channel,
+            state="normal" if (self._runner and self._runner.is_running) else "disabled",
+        )
+        self._save_btn.pack(side="left")
+        self._save_status = ctk.CTkLabel(btn_row, text="", text_color=P.overlay0,
+                                          font=ctk.CTkFont(size=10))
+        self._save_status.pack(side="left", padx=8)
+
+        ctk.CTkButton(btn_row, text="Close", width=80, height=30,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.text, command=self.destroy).pack(side="right")
+
+    # ── Row rendering ─────────────────────────────────────────────────────────
+
+    def _render_placeholder_rows(self):
+        # Pre-populate with slot numbers, empty names
+        self._channel_rows = [{"idx": i, "name": "", "hash": ""} for i in range(self._MAX_SLOTS)]
+        self._render_rows()
+
+    def _render_rows(self):
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+        self._channel_check_vars.clear()
+
+        # Current listen set (to pre-check boxes)
+        listen_set = self._current_listen_set()
+
+        for i, ch in enumerate(self._channel_rows):
+            idx = ch["idx"]
+            check = ctk.BooleanVar(value=(listen_set is None or idx in listen_set))
+            self._channel_check_vars.append(check)
+
+            ctk.CTkCheckBox(
+                self._list_frame, variable=check, text="",
+                width=20, checkbox_width=18, checkbox_height=18,
+                fg_color=P.blue, hover_color=P.sky, border_color=P.overlay0,
+            ).grid(row=i, column=0, padx=(4, 0), pady=3, sticky="w")
+
+            ctk.CTkLabel(self._list_frame,
+                         text=f"#{idx}",
+                         font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+                         text_color=P.blue, width=30, anchor="e",
+                         ).grid(row=i, column=1, padx=(4, 4), pady=3, sticky="e")
+
+            name_text = ch["name"] if ch["name"] else "(empty slot)"
+            name_color = P.text if ch["name"] else P.overlay0
+            lbl = ctk.CTkLabel(self._list_frame, text=name_text,
+                               font=ctk.CTkFont(family="Consolas", size=11),
+                               text_color=name_color, anchor="w")
+            lbl.grid(row=i, column=2, padx=(2, 4), pady=3, sticky="ew")
+            # Click label to pre-fill the edit form
+            lbl.bind("<Button-1>", lambda e, ch=ch: self._prefill_edit(ch))
+
+            hash_text = f"  [{ch['hash']}]" if ch.get("hash") else ""
+            ctk.CTkLabel(self._list_frame, text=hash_text,
+                         font=ctk.CTkFont(family="Consolas", size=10),
+                         text_color=P.overlay0, anchor="w", width=40,
+                         ).grid(row=i, column=3, padx=(0, 8), pady=3, sticky="w")
+
+    def _prefill_edit(self, ch: dict):
+        self._slot_var.set(str(ch["idx"]))
+        self._name_var.set(ch["name"])
+        self._secret_var.set("")
+
+    def _current_listen_set(self) -> "set[int] | None":
+        raw = (self._listen_var.get() or "").strip()
+        if not raw or raw.lower() in {"none", "null", "all", "[]"}:
+            return None  # all channels
+        parts = [x for x in raw.split() if x.isdigit()]
+        return set(int(x) for x in parts) if parts else None
+
+    def _populate_listen_filter(self):
+        """Pre-check boxes from the current listen_channels setting."""
+        self._render_rows()
+
+    # ── Fetch from device ─────────────────────────────────────────────────────
+
+    def _on_fetch(self):
+        if not self._runner or not self._runner.is_running:
+            self._fetch_status.configure(text="  Bridge not running")
+            return
+        self._fetch_btn.configure(state="disabled", text="⏳  Fetching…")
+        self._fetch_status.configure(text="")
+
+        import threading as _t
+        _t.Thread(target=self._fetch_thread, daemon=True).start()
+
+    def _fetch_thread(self):
+        try:
+            bridge = self._runner._bridge
+            if bridge is None:
+                self.after(0, lambda: self._fetch_done(None, "Bridge not ready"))
+                return
+            max_slots = int(bridge._telemetry.get("max_channels") or self._MAX_SLOTS)
+
+            # Fetch sequentially in a single coroutine — firing all at once causes
+            # every request to receive slot 0's CHANNEL_INFO event (serial is shared).
+            async def _fetch_all():
+                results = []
+                for i in range(max_slots):
+                    try:
+                        evt = await bridge.serial.execute(
+                            lambda mc, i=i: mc.commands.get_channel(i)
+                        )
+                        if evt and hasattr(evt, "payload"):
+                            p = evt.payload
+                            results.append({
+                                "idx":  p.get("channel_idx", i),
+                                "name": p.get("channel_name", ""),
+                                "hash": p.get("channel_hash", ""),
+                            })
+                        else:
+                            results.append({"idx": i, "name": "", "hash": ""})
+                    except Exception:
+                        results.append({"idx": i, "name": "", "hash": ""})
+                return results
+
+            fut = self._runner.submit(_fetch_all())
+            channels = fut.result(timeout=max_slots * 3.0)
+            self.after(0, lambda: self._fetch_done(channels, None))
+        except Exception as exc:
+            self.after(0, lambda: self._fetch_done(None, str(exc)))
+
+    def _fetch_done(self, channels: list | None, error: str | None):
+        self._fetch_btn.configure(state="normal", text="🔄  Fetch from device")
+        if error:
+            self._fetch_status.configure(text=f"  Error: {error}", text_color=P.red)
+            return
+        self._fetch_status.configure(text=f"  Loaded {len(channels)} slots", text_color=P.green)
+        self._channel_rows = channels
+        self._render_rows()
+
+    # ── Apply filter ──────────────────────────────────────────────────────────
+
+    def _apply_filter(self):
+        checked = [self._channel_rows[i]["idx"]
+                   for i, var in enumerate(self._channel_check_vars) if var.get()]
+        total = len(self._channel_check_vars)
+        if len(checked) == total:
+            # All checked = listen to all
+            self._listen_var.set("")
+        else:
+            self._listen_var.set(" ".join(str(x) for x in sorted(checked)))
+        self.destroy()
+
+    # ── Save channel to device ────────────────────────────────────────────────
+
+    def _on_save_channel(self):
+        if not self._runner or not self._runner.is_running:
+            self._save_status.configure(text="  Bridge not running", text_color=P.red)
+            return
+
+        slot_raw = self._slot_var.get().strip()
+        name = self._name_var.get().strip()
+        secret_hex = self._secret_var.get().strip()
+
+        if not slot_raw.isdigit():
+            self._save_status.configure(text="  Slot must be a number", text_color=P.red)
+            return
+        if not name:
+            self._save_status.configure(text="  Name required", text_color=P.red)
+            return
+        if secret_hex and len(secret_hex.replace(" ", "")) != 32:
+            self._save_status.configure(text="  Secret must be 32 hex chars (16 bytes)", text_color=P.red)
+            return
+        try:
+            secret_bytes = bytes.fromhex(secret_hex.replace(" ", "")) if secret_hex else None
+        except ValueError:
+            self._save_status.configure(text="  Invalid hex in secret", text_color=P.red)
+            return
+
+        idx = int(slot_raw)
+        self._save_btn.configure(state="disabled", text="⏳  Saving…")
+        self._save_status.configure(text="")
+
+        import threading as _t
+        _t.Thread(target=self._save_thread, args=(idx, name, secret_bytes), daemon=True).start()
+
+    def _save_thread(self, idx: int, name: str, secret: bytes | None):
+        try:
+            bridge = self._runner._bridge
+            if bridge is None:
+                self.after(0, lambda: self._save_done(False, "Bridge not ready"))
+                return
+            fut = self._runner.submit(
+                bridge.serial.execute(lambda mc: mc.commands.set_channel(idx, name, secret))
+            )
+            evt = fut.result(timeout=6.0)
+            ok = evt is not None and getattr(evt, "type", None) is not None
+            err_msg = None if ok else "Device returned error"
+            self.after(0, lambda: self._save_done(ok, err_msg))
+        except Exception as exc:
+            self.after(0, lambda: self._save_done(False, str(exc)))
+
+    def _save_done(self, success: bool, error: str | None):
+        self._save_btn.configure(state="normal", text="💾  Save to Device")
+        if success:
+            self._save_status.configure(text="  ✓ Saved!", text_color=P.green)
+            # Re-fetch to show updated name
+            self._on_fetch()
+        else:
+            self._save_status.configure(text=f"  Error: {error}", text_color=P.red)
 
 
 # ── Add / Edit Provider popup ─────────────────────────────────────────────────
@@ -794,17 +1131,11 @@ class App(ctk.CTk):
 
         self._vars["listen_channels"] = ctk.StringVar(value="")
         row = self._row(scroll, "Listen Channels")
-        ctk.CTkEntry(row, textvariable=self._vars["listen_channels"],
-                     fg_color=P.surface0, text_color=P.text,
-                     border_width=0).grid(row=0, column=1, sticky="ew")
-        self._hint(scroll, "blank = all  |  space-separated numbers: 0 2 3")
-
-        self._vars["reply_channel"] = ctk.StringVar(value="")
-        row = self._row(scroll, "Reply Channel")
-        ctk.CTkEntry(row, textvariable=self._vars["reply_channel"],
-                     width=80, fg_color=P.surface0, text_color=P.text,
-                     border_width=0).grid(row=0, column=1, sticky="w")
-        self._hint(scroll, "blank = same channel as the question")
+        ctk.CTkButton(row, text="📡  Manage Channels", height=30, width=180,
+                      fg_color=P.surface1, hover_color=P.surface2,
+                      text_color=P.text, corner_radius=6,
+                      command=self._open_channels_dialog).grid(row=0, column=1, sticky="w")
+        self._hint(scroll, "fetch from device, pick which channels to listen on, add private channels")
 
     # ── Tab: Timing ───────────────────────────────────────────────────────────
 
@@ -1241,6 +1572,9 @@ class App(ctk.CTk):
             log.debug("discoveries load failed: %s", exc)
 
     # ── Dialog helpers ────────────────────────────────────────────────────────
+
+    def _open_channels_dialog(self):
+        _ChannelsDialog(self, self._runner, self._vars["listen_channels"])
 
     def _open_api_keys_dialog(self):
         _APIKeysDialog(self, self._vars)

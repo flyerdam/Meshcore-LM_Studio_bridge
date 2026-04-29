@@ -3,6 +3,7 @@ Web-based services: weather, news, and DuckDuckGo search.
 """
 
 import logging
+import os
 
 import requests
 
@@ -54,9 +55,9 @@ class WebSearch:
             return "Error fetching weather"
 
     def news(self, query: str | None = None) -> str:
-        key = self.cfg.get("news_api_key")
+        key = self.cfg.get("news_api_key") or os.getenv("NEWS_API_KEY")
         if not key:
-            return "No NewsAPI key. Use --news-key (newsapi.org, free)"
+            return "No NewsAPI key. Set NEWS_API_KEY env var or add via API Keys dialog (newsapi.org, free)"
         try:
             if query:
                 url, params = "https://newsapi.org/v2/everything", {
